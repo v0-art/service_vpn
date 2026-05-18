@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LUFFY Control Tower</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        /* Адаптация под цвета темы Telegram */
+        body {
+            background-color: var(--tg-theme-bg-color, #f3f4f6);
+            color: var(--tg-theme-text-color, #111827);
+        }
+        .tg-button {
+            background-color: var(--tg-theme-button-color, #3b82f6);
+            color: var(--tg-theme-button-text-color, #ffffff);
+        }
+    </style>
+</head>
+<body class="p-4 font-sans">
+
+    <h1 class="text-2xl font-bold mb-4 border-b pb-2">🏴‍☠️ LUFFY Cluster</h1>
+
+    <!-- Секция: Список нод -->
+    <div class="mb-6">
+        <h2 class="text-xl font-semibold mb-2">Инвентарь серверов</h2>
+        <div id="nodes-list" class="space-y-2">
+            <p class="text-sm text-gray-500">Загрузка...</p>
+        </div>
+    </div>
+
+    <!-- Секция: Управление HAProxy -->
+    <div class="mb-6 bg-white p-4 rounded-lg shadow border border-gray-200">
+        <h2 class="text-xl font-semibold mb-2 text-gray-800">HAProxy Config Editor</h2>
+        
+        <label class="block text-sm font-medium text-gray-700 mb-1">IP Ноды (Ingress/Master)</label>
+        <input type="text" id="haproxy-ip" placeholder="192.168.1.10" 
+               class="w-full p-2 border rounded mb-3 text-gray-900 focus:ring-blue-500 focus:border-blue-500">
+        
+        <label class="block text-sm font-medium text-gray-700 mb-1">Новый haproxy.cfg</label>
+        <textarea id="haproxy-config" rows="6" placeholder="global\n    log /dev/log local0..." 
+                  class="w-full p-2 border rounded mb-3 font-mono text-sm text-gray-900 focus:ring-blue-500 focus:border-blue-500"></textarea>
+        
+        <button onclick="deployHAProxy()" class="tg-button w-full py-2 rounded font-semibold shadow-sm transition-opacity hover:opacity-90">
+            🚀 Проверить и Задеплоить
+        </button>
+        
+        <div id="deploy-result" class="mt-3 text-sm hidden p-2 rounded"></div>
+    </div>
+
+    <script>
+        // Инициализация Telegram WebApp
+        const tg = window.Telegram.WebApp;
+        tg.expand(); // Разворачиваем на весь экран
+
+        // Загрузка списка нод
+        async function loadNodes() {
+            try {
+                const response = await fetch('/api/nodes');
+                const nodes = await response.json();
+                const container = document.getElementById('nodes-list');
+                
+                if (nodes.length === 0) {
+                    container.innerHTML = '<p class="text-sm text-gray-500">Нет добавленных серверов.</p>';
+                    return;
+                }
+
+                container.innerHTML = nodes.map(node => `
+                    <div class="p-3 bg-white rounded shadow-sm border border-gray-200 flex justify-between items-center">
+                        <div>
+                            <div class="font-bold text-gray-800">${node.ip}</div>
+                            <div class="text-xs text-gray-500">Роль: ${node.role} | Оплата: ${node.billing_date}</div>
+                        </div>
+                        <div class="text-xs px-2 py-1 rounded ${node.status === 'active' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
+                            ${node.status}
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                document.getElementById('nodes-list').innerHTML = '<p class="text-sm text-red-500">Ошибка загрузки данных.</p>';
+            }
+        }
+
+        // Деплой HAProxy
+        async function deployHAProxy() {
+            const ip = document.getElementById('haproxy-ip').value;
+            const configContent = document.getElementById('haproxy-config').value;
+            const resultDiv = document.getElementById('deploy-result');
+
+            if (!ip || !configContent) {
+                tg.showAlert("Заполните IP и конфигурацию!");
+                return;
+            }
+
+            resultDiv.classList.remove('hidden', 'bg-green-100', 'text-green-800', 'bg-red-100', 'text-red-800');
+            resultDiv.classList.add('bg-blue-100', 'text-blue-800');
+            resultDiv.innerText = "⏳ Выполняется деплой и проверка синтаксиса...";
+
+            try {
+                const response = await fetch('/api/haproxy/apply', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip: ip, config_content: configContent })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    resultDiv.classList.replace('bg-blue-100', 'bg-green-100');
+                    resultDiv.classList.replace('text-blue-800', 'text-green-800');
+                    resultDiv.innerText = "✅ " + data.message;
+                    tg.HapticFeedback.notificationOccurred('success');
+                } else {
+                    resultDiv.classList.replace('bg-blue-100', 'bg-red-100');
+                    resultDiv.classList.replace('text-blue-800', 'text-red-800');
+                    resultDiv.innerText = "❌ Ошибка:\n" + data.detail;
+                    tg.HapticFeedback.notificationOccurred('error');
+                }
+            } catch (error) {
+                resultDiv.classList.replace('bg-blue-100', 'bg-red-100');
+                resultDiv.classList.replace('text-blue-800', 'text-red-800');
+                resultDiv.innerText = "❌ Сетевая ошибка при обращении к API.";
+            }
+        }
+
+        // Запуск при загрузке
+        loadNodes();
+    </script>
+</body>
+</html>

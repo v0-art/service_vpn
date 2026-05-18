@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  control-tower:
+    build: .
+    container_name: luffy-control-tower
+    restart: always
+    ports:
+      # Пробрасываем веб-интерфейс и API на хост-машину
+      - "8085:8085"
+    volumes:
+      # Постоянное хранение SQLite базы данных
+      - ./data:/app/data
+      # Постоянное хранение логов
+      - ./logs:/app/logs
+      # Проброс SSH-ключей хоста для беспарольного подключения к нодам кластера
+      - /root/.ssh:/root/.ssh:ro
+    env_file:
+      - .env
+    environment:
+      # Переопределяем путь к БД для сохранения внутри примонтированного volume
+      - DB_PATH=/app/data/luffy_cluster.db

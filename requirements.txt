@@ -1,0 +1,8 @@
+aiogram>=3.4.0
+fastapi>=0.110.0
+uvicorn>=0.27.0
+aiosqlite>=0.20.0
+asyncssh>=2.14.0
+pydantic-settings>=2.2.1
+apscheduler>=3.10.4
+aiohttp>=3.9.3

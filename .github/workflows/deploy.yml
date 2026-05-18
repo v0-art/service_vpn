@@ -1,0 +1,31 @@
+name: Deploy Control Tower
+
+on:
+  push:
+    branches:
+      - main  # Воркфлоу запускается при пуше изменений в ветку main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}          # IP-адрес вашего VPS
+          username: ${{ secrets.SSH_USERNAME }}  # Имя пользователя (например, root)
+          key: ${{ secrets.SSH_KEY }}            # Приватный SSH-ключ для авторизации на VPS
+          port: ${{ secrets.SSH_PORT || 22 }}    # Порт SSH (по умолчанию 22)
+          script: |
+            # Переходим в рабочую папку на сервере (замените путь на свой, если он отличается)
+            cd /root/service_vpn
+            
+            # Подтягиваем последние изменения
+            git pull origin main
+            
+            # Пересобираем и запускаем контейнеры в Docker
+            docker compose down
+            docker compose up --build -d
+            
+            # Удаляем неиспользуемые промежуточные docker-образы для очистки диска
+            docker image prune -f
