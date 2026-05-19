@@ -19,10 +19,23 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 async def cmd_start(message: types.Message) -> None:
     if not message.from_user or not is_admin(message.from_user.id):
         return
-    
-    # Создаем кнопку для открытия Mini App
-    # ВАЖНО: URL должен быть HTTPS. Для локальных тестов используйте ngrok (например, https://your-ngrok-url.app)
-    web_app_url = "https://ВАШ_ДОМЕН_ИЛИ_NGROK/" 
+
+    web_app_url = config.WEB_APP_URL.strip()
+    if not web_app_url:
+        await message.answer(
+            "⚠️ Mini App не настроен: в `.env` отсутствует `WEB_APP_URL`.\n"
+            "Пример: <code>WEB_APP_URL=https://your-domain.example</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if not web_app_url.startswith("https://"):
+        await message.answer(
+            "⚠️ `WEB_APP_URL` должен начинаться с `https://`.\n"
+            "Telegram Web App не открывается по `http://`.",
+            parse_mode="HTML",
+        )
+        return
     
     markup = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🎛 Открыть Control Tower", web_app=WebAppInfo(url=web_app_url))]],

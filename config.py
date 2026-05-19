@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # Web
     WEB_HOST: str = "127.0.0.1"
     WEB_PORT: int = 8080
+    WEB_APP_URL: str = ""
 
     # Настройки Pydantic для чтения из .env файла
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

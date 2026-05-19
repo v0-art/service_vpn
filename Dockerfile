@@ -26,7 +26,7 @@ COPY . .
 RUN mkdir -p logs data
 
 # Открываем порт для FastAPI веб-интерфейса и API
-EXPOSE 8085
+EXPOSE 8080
 
 # Запуск приложения
 CMD ["python", "main.py"]
