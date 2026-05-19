@@ -1,13 +1,11 @@
-version: '3.8'
-
 services:
   control-tower:
     build: .
     container_name: luffy-control-tower
     restart: always
     ports:
-      # Пробрасываем веб-интерфейс и API на хост-машину (Nginx ждет его на 8080)
-      - "8080:8080"
+      # Пробрасываем веб-интерфейс и API на хост-машину. Порт берется из WEB_PORT в .env
+      - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
     volumes:
       # Постоянное хранение SQLite базы данных
       - ./data:/app/data
@@ -22,5 +20,3 @@ services:
       - DB_PATH=/app/data/luffy_cluster.db
       # Внутри докер-контейнера сервер ОБЯЗАТЕЛЬНО должен слушать 0.0.0.0 для приема запросов извне
       - WEB_HOST=0.0.0.0
-      # Указываем правильный порт, чтобы он совпадал с проброшенным портом (8080)
-      - WEB_PORT=8080
