@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Telegram
-    BOT_TOKEN: str = ""
+    BOT_TOKEN: str = "123456789:AAG_fake_token_placeholder_for_validation"
     ADMIN_ID: int = 0
 
     # SSH
