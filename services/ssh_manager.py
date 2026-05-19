@@ -14,6 +14,7 @@ class SSHManager:
     def __init__(self) -> None:
         self.default_user: str = config.SSH_DEFAULT_USER
         self.key_path: str = config.SSH_KEY_PATH
+        self.port: int = config.SSH_PORT
 
     async def execute_command(
         self, 
@@ -62,6 +63,7 @@ class SSHManager:
             # Для динамического кластера VPN это необходимо.
             async with asyncssh.connect(
                 host, 
+                port=self.port,
                 username=target_user, 
                 client_keys=client_keys, 
                 known_hosts=None

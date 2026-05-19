@@ -15,7 +15,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}          # IP-адрес вашего VPS
           username: ${{ secrets.SSH_USERNAME }}  # Имя пользователя (например, root)
           key: ${{ secrets.SSH_KEY }}            # Приватный SSH-ключ для авторизации на VPS
-          port: ${{ secrets.SSH_PORT || 22 }}    # Порт SSH (по умолчанию 22)
+          port: ${{ secrets.SSH_PORT }}          # Порт SSH (например, 2222)
           script: |
             # Переходим в рабочую папку на сервере (замените путь на свой, если он отличается)
             cd /root/service_vpn

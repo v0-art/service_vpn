@@ -34,6 +34,7 @@ class NodeDeployer:
             # Подключаемся строго по паролю для первичной настройки
             async with asyncssh.connect(
                 ip, 
+                port=config.SSH_PORT,
                 username=config.SSH_DEFAULT_USER, 
                 password=password, 
                 known_hosts=None
