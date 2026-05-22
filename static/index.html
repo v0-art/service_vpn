@@ -21,6 +21,7 @@
 <body class="p-4 font-sans">
 
     <h1 class="text-2xl font-bold mb-4 border-b pb-2">🏴‍☠️ LUFFY Cluster</h1>
+    <div id="access-warning" class="mb-4 hidden p-3 rounded border border-red-300 bg-red-50 text-red-700 text-sm"></div>
 
     <!-- Секция: Список нод -->
     <div class="mb-6">
@@ -28,6 +29,42 @@
         <div id="nodes-list" class="space-y-2">
             <p class="text-sm text-gray-500">Загрузка...</p>
         </div>
+    </div>
+
+    <!-- Секция: Добавление ноды -->
+    <div class="mb-6 bg-white p-4 rounded-lg shadow border border-gray-200">
+        <h2 class="text-xl font-semibold mb-3 text-gray-800">Добавить сервер</h2>
+
+        <div class="grid gap-3 md:grid-cols-3 mb-3">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">IP</label>
+                <input type="text" id="node-ip" placeholder="203.0.113.10"
+                    class="w-full p-2 border rounded text-gray-900 focus:ring-blue-500 focus:border-blue-500">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Роль</label>
+                <select id="node-role" class="w-full p-2 border rounded text-gray-900 focus:ring-blue-500 focus:border-blue-500">
+                    <option value="ingress">ingress</option>
+                    <option value="egress">egress</option>
+                    <option value="master">master</option>
+                </select>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Дата оплаты</label>
+                <input type="date" id="node-billing-date"
+                    class="w-full p-2 border rounded text-gray-900 focus:ring-blue-500 focus:border-blue-500">
+            </div>
+        </div>
+
+        <label class="block text-sm font-medium text-gray-700 mb-1">Приватный SSH ключ (опционально)</label>
+        <textarea id="node-ssh-key" rows="4" placeholder="Если оставить пустым — ключ будет сгенерирован автоматически"
+            class="w-full p-2 border rounded mb-3 font-mono text-sm text-gray-900 focus:ring-blue-500 focus:border-blue-500"></textarea>
+
+        <button onclick="addNode()" class="tg-button w-full py-2 rounded font-semibold shadow-sm transition-opacity hover:opacity-90">
+            ➕ Добавить сервер
+        </button>
+
+        <div id="add-node-result" class="mt-3 text-sm hidden p-2 rounded"></div>
     </div>
 
     <!-- Секция: Управление HAProxy -->
@@ -51,13 +88,53 @@
 
     <script>
         // Инициализация Telegram WebApp
-        const tg = window.Telegram.WebApp;
-        tg.expand(); // Разворачиваем на весь экран
+        const tg = window.Telegram?.WebApp;
+        if (tg) {
+            tg.expand();
+        }
+
+        function setWarning(text) {
+            const warning = document.getElementById('access-warning');
+            warning.classList.remove('hidden');
+            warning.innerText = text;
+        }
+
+        function getTelegramInitData() {
+            return tg?.initData || '';
+        }
+
+        function telegramAlert(message) {
+            if (tg?.showAlert) {
+                tg.showAlert(message);
+            } else {
+                alert(message);
+            }
+        }
+
+        async function apiFetch(url, options = {}) {
+            const initData = getTelegramInitData();
+            if (!initData) {
+                throw new Error('Mini App должен быть открыт из Telegram-бота.');
+            }
+
+            const headers = options.headers ? { ...options.headers } : {};
+            headers['X-Telegram-Init-Data'] = initData;
+
+            if (options.body && !headers['Content-Type']) {
+                headers['Content-Type'] = 'application/json';
+            }
+
+            return fetch(url, { ...options, headers });
+        }
 
         // Загрузка списка нод
         async function loadNodes() {
             try {
-                const response = await fetch('/api/nodes');
+                const response = await apiFetch('/api/nodes');
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}));
+                    throw new Error(err.detail || `HTTP ${response.status}`);
+                }
                 const nodes = await response.json();
                 const container = document.getElementById('nodes-list');
                 
@@ -78,7 +155,61 @@
                     </div>
                 `).join('');
             } catch (error) {
-                document.getElementById('nodes-list').innerHTML = '<p class="text-sm text-red-500">Ошибка загрузки данных.</p>';
+                document.getElementById('nodes-list').innerHTML = `<p class="text-sm text-red-500">Ошибка загрузки данных: ${error.message}</p>`;
+                setWarning('Доступ к API разрешен только из Telegram Mini App для ADMIN_ID.');
+            }
+        }
+
+        async function addNode() {
+            const ip = document.getElementById('node-ip').value.trim();
+            const role = document.getElementById('node-role').value.trim();
+            const billingDate = document.getElementById('node-billing-date').value.trim();
+            const sshKey = document.getElementById('node-ssh-key').value.trim();
+            const resultDiv = document.getElementById('add-node-result');
+
+            if (!ip || !role || !billingDate) {
+                telegramAlert('Заполните IP, роль и дату оплаты.');
+                return;
+            }
+
+            const payload = {
+                ip: ip,
+                role: role,
+                billing_date: billingDate,
+            };
+            if (sshKey) {
+                payload.ssh_key = sshKey;
+            }
+
+            resultDiv.classList.remove('hidden', 'bg-green-100', 'text-green-800', 'bg-red-100', 'text-red-800');
+            resultDiv.classList.add('bg-blue-100', 'text-blue-800');
+            resultDiv.innerText = '⏳ Добавляю ноду...';
+
+            try {
+                const response = await apiFetch('/api/nodes', {
+                    method: 'POST',
+                    body: JSON.stringify(payload),
+                });
+                const data = await response.json().catch(() => ({}));
+
+                if (response.ok) {
+                    resultDiv.classList.replace('bg-blue-100', 'bg-green-100');
+                    resultDiv.classList.replace('text-blue-800', 'text-green-800');
+                    resultDiv.innerText = `✅ ${data.message || 'Нода добавлена.'}`;
+                    document.getElementById('node-ip').value = '';
+                    document.getElementById('node-ssh-key').value = '';
+                    await loadNodes();
+                    tg?.HapticFeedback?.notificationOccurred('success');
+                } else {
+                    resultDiv.classList.replace('bg-blue-100', 'bg-red-100');
+                    resultDiv.classList.replace('text-blue-800', 'text-red-800');
+                    resultDiv.innerText = `❌ Ошибка: ${data.detail || 'не удалось добавить ноду.'}`;
+                    tg?.HapticFeedback?.notificationOccurred('error');
+                }
+            } catch (error) {
+                resultDiv.classList.replace('bg-blue-100', 'bg-red-100');
+                resultDiv.classList.replace('text-blue-800', 'text-red-800');
+                resultDiv.innerText = `❌ Сетевая ошибка: ${error.message}`;
             }
         }
 
@@ -89,7 +220,7 @@
             const resultDiv = document.getElementById('deploy-result');
 
             if (!ip || !configContent) {
-                tg.showAlert("Заполните IP и конфигурацию!");
+                telegramAlert("Заполните IP и конфигурацию!");
                 return;
             }
 
@@ -98,33 +229,35 @@
             resultDiv.innerText = "⏳ Выполняется деплой и проверка синтаксиса...";
 
             try {
-                const response = await fetch('/api/haproxy/apply', {
+                const response = await apiFetch('/api/haproxy/apply', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ ip: ip, config_content: configContent })
                 });
 
-                const data = await response.json();
+                const data = await response.json().catch(() => ({}));
 
                 if (response.ok) {
                     resultDiv.classList.replace('bg-blue-100', 'bg-green-100');
                     resultDiv.classList.replace('text-blue-800', 'text-green-800');
                     resultDiv.innerText = "✅ " + data.message;
-                    tg.HapticFeedback.notificationOccurred('success');
+                    tg?.HapticFeedback?.notificationOccurred('success');
                 } else {
                     resultDiv.classList.replace('bg-blue-100', 'bg-red-100');
                     resultDiv.classList.replace('text-blue-800', 'text-red-800');
-                    resultDiv.innerText = "❌ Ошибка:\n" + data.detail;
-                    tg.HapticFeedback.notificationOccurred('error');
+                    resultDiv.innerText = "❌ Ошибка:\n" + (data.detail || 'неизвестная ошибка');
+                    tg?.HapticFeedback?.notificationOccurred('error');
                 }
             } catch (error) {
                 resultDiv.classList.replace('bg-blue-100', 'bg-red-100');
                 resultDiv.classList.replace('text-blue-800', 'text-red-800');
-                resultDiv.innerText = "❌ Сетевая ошибка при обращении к API.";
+                resultDiv.innerText = "❌ Сетевая ошибка при обращении к API: " + error.message;
             }
         }
 
         // Запуск при загрузке
+        if (!getTelegramInitData()) {
+            setWarning('Панель нужно открывать через кнопку в Telegram-боте. Прямой вход из браузера ограничен.');
+        }
         loadNodes();
     </script>
 </body>

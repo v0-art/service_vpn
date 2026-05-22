@@ -1,13 +1,142 @@
+import hashlib
+import hmac
+import json
 import logging
-from fastapi import APIRouter, HTTPException, Body
+import time
+from urllib.parse import parse_qsl
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
+from config import config
 from db.database import get_db_connection
 from services.haproxy_manager import haproxy_manager
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["MiniApp API"])
+
+TELEGRAM_INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def _validate_telegram_init_data(init_data: str) -> Dict[str, Any]:
+    """
+    Проверяет подпись Telegram WebApp initData согласно документации Telegram.
+    Возвращает распарсенный user-объект при успешной проверке.
+    """
+    parsed_pairs = parse_qsl(init_data, keep_blank_values=True)
+    if not parsed_pairs:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Отсутствуют параметры Telegram initData.",
+        )
+
+    data: Dict[str, str] = {}
+    received_hash: Optional[str] = None
+
+    for key, value in parsed_pairs:
+        if key == "hash":
+            received_hash = value
+        else:
+            data[key] = value
+
+    if not received_hash:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Отсутствует hash в Telegram initData.",
+        )
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret_key = hmac.new(
+        b"WebAppData",
+        config.BOT_TOKEN.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    calculated_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Невалидная подпись Telegram initData.",
+        )
+
+    auth_date_raw = data.get("auth_date")
+    if auth_date_raw:
+        try:
+            auth_date = int(auth_date_raw)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Некорректный auth_date в Telegram initData.",
+            ) from exc
+
+        if abs(int(time.time()) - auth_date) > TELEGRAM_INIT_DATA_MAX_AGE_SECONDS:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Telegram initData устарел. Откройте Mini App заново из бота.",
+            )
+
+    user_raw = data.get("user")
+    if not user_raw:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="В Telegram initData нет user-данных.",
+        )
+
+    try:
+        user = json.loads(user_raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Не удалось распарсить user из Telegram initData.",
+        ) from exc
+
+    return user
+
+
+async def require_telegram_admin(
+    x_telegram_init_data: Optional[str] = Header(default=None, alias="X-Telegram-Init-Data"),
+) -> Dict[str, Any]:
+    """
+    Гейт авторизации для Mini App API:
+    - запрос должен прийти из Telegram Mini App (initData)
+    - подпись initData должна быть валидна
+    - пользователь должен совпадать с ADMIN_ID из env
+    """
+    if config.ADMIN_ID <= 0:
+        logger.error("ADMIN_ID не настроен, API заблокирован.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ADMIN_ID не настроен на сервере.",
+        )
+
+    if not x_telegram_init_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Требуется Telegram initData. Откройте панель через кнопку бота.",
+        )
+
+    user = _validate_telegram_init_data(x_telegram_init_data)
+    user_id = int(user.get("id", 0))
+
+    if user_id != config.ADMIN_ID:
+        logger.warning("Доступ запрещен: user_id=%s, ADMIN_ID=%s", user_id, config.ADMIN_ID)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Доступ запрещен: вы не администратор.",
+        )
+
+    return user
+
+
+router = APIRouter(
+    prefix="/api",
+    tags=["MiniApp API"],
+    dependencies=[Depends(require_telegram_admin)],
+)
 
 # --- Pydantic Модели ---
 class NodeCreate(BaseModel):
