@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from urllib.parse import parse_qsl
 
@@ -12,6 +13,8 @@ from typing import List, Dict, Any, Optional
 from config import config
 from db.database import get_db_connection
 from services.haproxy_manager import haproxy_manager
+from services.marzban import marzban_manager
+from services.ssh_manager import ssh_manager
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +150,14 @@ class NodeCreate(BaseModel):
 
 class HAProxyUpdate(BaseModel):
     ip: str
-    config_content: str
+    config_content: Optional[str] = None
+    # Backward compatibility with the current frontend bundle:
+    # it sends "config" instead of "config_content".
+    config: Optional[str] = None
+
+
+class SysinfoRequest(BaseModel):
+    ip: str
 
 # --- Эндпоинты ---
 
@@ -199,11 +209,168 @@ async def apply_haproxy_config(data: HAProxyUpdate) -> Dict[str, str]:
     Использует HAProxyManager для безопасного деплоя с откатом.
     """
     logger.info(f"Запрос на обновление HAProxy для {data.ip}")
-    
-    success, message = await haproxy_manager.apply_config(data.ip, data.config_content)
+
+    config_content = (data.config_content or data.config or "").strip()
+    if not config_content:
+        raise HTTPException(
+            status_code=400,
+            detail="Пустая конфигурация: передайте 'config_content' (или 'config' для совместимости).",
+        )
+
+    success, message = await haproxy_manager.apply_config(data.ip, config_content)
     
     if success:
         return {"status": "success", "message": message}
     else:
         # Возвращаем 400 с текстом ошибки (например, синтаксической), чтобы показать в UI
         raise HTTPException(status_code=400, detail=message)
+
+
+@router.post("/sysinfo")
+async def get_sysinfo(data: SysinfoRequest) -> Dict[str, Any]:
+    """
+    Выполняет базовую диагностику ноды и возвращает логи строками для UI.
+    """
+    command = (
+        "echo '[INFO] Connecting...' ; "
+        "echo '--- UPTIME ---'; uptime; "
+        "echo '--- RAM ---'; free -m; "
+        "echo '--- DISK ---'; df -h /"
+    )
+    success, result = await ssh_manager.execute_command(data.ip, command, timeout=25)
+    if not success:
+        raise HTTPException(status_code=400, detail=result)
+
+    logs = [line for line in result.splitlines() if line.strip()]
+    return {"ip": data.ip, "logs": logs}
+
+
+@router.get("/marzban/stats")
+async def get_marzban_stats() -> Dict[str, Any]:
+    """
+    Возвращает агрегированную статистику для вкладки Marzban:
+    - top_users
+    - anomalies (эвристические предупреждения)
+    """
+    users = await marzban_manager.get_users()
+    if not users:
+        return {"anomalies": [], "top_users": []}
+
+    active_users = [u for u in users if u.get("status") == "active"]
+    sorted_users = sorted(active_users, key=lambda x: x.get("used_traffic", 0), reverse=True)
+
+    top_users: List[Dict[str, Any]] = []
+    anomalies: List[Dict[str, Any]] = []
+
+    for idx, user in enumerate(sorted_users[:10], start=1):
+        username = str(user.get("username", "unknown"))
+        used_traffic = int(user.get("used_traffic", 0) or 0)
+        status = str(user.get("status", "unknown"))
+        used_gb = round(used_traffic / (1024 ** 3), 2)
+
+        top_users.append(
+            {
+                "username": username,
+                "traffic": f"{used_gb} GB",
+                "status": status,
+                "used_bytes": used_traffic,
+            }
+        )
+
+        data_limit = user.get("data_limit")
+        if data_limit:
+            try:
+                limit_int = int(data_limit)
+            except (TypeError, ValueError):
+                limit_int = 0
+
+            if limit_int > 0:
+                usage_ratio = used_traffic / limit_int
+                if usage_ratio >= 0.95:
+                    anomalies.append(
+                        {
+                            "id": f"limit-{idx}",
+                            "text": f"Пользователь {username} израсходовал {round(usage_ratio * 100, 1)}% лимита.",
+                            "severity": "high",
+                        }
+                    )
+                elif usage_ratio >= 0.85:
+                    anomalies.append(
+                        {
+                            "id": f"limit-{idx}",
+                            "text": f"Пользователь {username} приближается к лимиту ({round(usage_ratio * 100, 1)}%).",
+                            "severity": "medium",
+                        }
+                    )
+
+    return {"anomalies": anomalies, "top_users": top_users[:5]}
+
+
+@router.get("/security/audit")
+async def get_security_audit() -> Dict[str, Any]:
+    """
+    Возвращает:
+    - список забаненных IP (по UFW на ingress-нодах)
+    - недавние SSH события (Accepted/Rejected)
+    """
+    async with get_db_connection() as db:
+        async with db.execute("SELECT ip FROM nodes WHERE role = 'ingress' AND status = 'active'") as cursor:
+            ingress_nodes = await cursor.fetchall()
+        async with db.execute("SELECT ip FROM nodes WHERE status = 'active'") as cursor:
+            all_nodes = await cursor.fetchall()
+
+    banned_ips: List[Dict[str, str]] = []
+    ssh_logins: List[Dict[str, str]] = []
+
+    for node in ingress_nodes:
+        node_ip = node["ip"]
+        success, output = await ssh_manager.execute_command(
+            node_ip,
+            "ufw status | grep 'DENY IN' || true",
+            timeout=15,
+        )
+        if not success:
+            continue
+
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            if not match:
+                continue
+            banned_ips.append(
+                {
+                    "ip": match.group(1),
+                    "reason": "UFW DENY IN",
+                    "date": "latest",
+                }
+            )
+
+    for node in all_nodes:
+        node_ip = node["ip"]
+        success, output = await ssh_manager.execute_command(
+            node_ip,
+            "journalctl -u ssh --since '24 hours ago' | grep -E 'Accepted|Failed password|Invalid user' | tail -n 20 || true",
+            timeout=20,
+        )
+        if not success:
+            continue
+
+        for line in output.splitlines():
+            raw = line.strip()
+            if not raw:
+                continue
+            source_match = re.search(r"from (\d{1,3}(?:\.\d{1,3}){3})", raw)
+            source_ip = source_match.group(1) if source_match else "Unknown"
+            status_text = "Accepted" if "Accepted" in raw else "Rejected"
+            ssh_logins.append(
+                {
+                    "ip": source_ip,
+                    "target": node_ip,
+                    "status": status_text,
+                    "date": raw[:32],
+                }
+            )
+
+    return {"banned_ips": banned_ips[:100], "ssh_logins": ssh_logins[:100]}

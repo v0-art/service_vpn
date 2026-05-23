@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { fetchNodes, addNode, applyHAProxyConfig } from './api';
+import { fetchNodes, addNode, applyHAProxyConfig, isTelegramContext } from './api';
 import { Node as AppNode } from './types';
 import { MarzbanStats } from './components/MarzbanStats';
 import { SecurityAudit } from './components/SecurityAudit';
@@ -21,6 +21,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'inventory' | 'deploy' | 'haproxy' | 'marzban' | 'security' | 'logs'>('inventory');
   const [nodes, setNodes] = useState<AppNode[]>([]);
   const [loading, setLoading] = useState(true);
+  const [warning, setWarning] = useState<string | null>(null);
+
+  const inTelegram = isTelegramContext();
 
   const loadNodes = async () => {
     setLoading(true);
@@ -30,8 +33,19 @@ export default function App() {
   };
 
   useEffect(() => {
+    // @ts-ignore
+    const tg = typeof window !== 'undefined' ? window.Telegram?.WebApp : undefined;
+    tg?.ready?.();
+    tg?.expand?.();
+
+    if (!inTelegram) {
+      setWarning('Панель должна открываться через кнопку в Telegram-боте. Внешний вход ограничен.');
+    } else {
+      setWarning(null);
+    }
+
     loadNodes();
-  }, []);
+  }, [inTelegram]);
 
   return (
     <div className="flex h-screen w-full bg-app-bg text-app-text">
@@ -143,6 +157,11 @@ export default function App() {
 
         {/* Content Area */}
         <div className="p-5 flex-grow overflow-y-auto">
+           {warning && (
+             <div className="mb-4 border border-app-danger/40 bg-app-danger/10 text-app-danger rounded-lg p-3 text-xs font-mono">
+               {warning}
+             </div>
+           )}
            <AnimatePresence mode="wait">
              {activeTab === 'inventory' && (
                <motion.div
@@ -474,4 +493,3 @@ function HAProxyForm({ nodes }: { nodes: AppNode[] }) {
     </form>
   );
 }
-

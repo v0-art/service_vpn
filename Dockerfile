@@ -1,4 +1,13 @@
-# Используем легкий официальный образ Python
+# ---------- Stage 1: Frontend build ----------
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ---------- Stage 2: Backend runtime ----------
 FROM python:3.11-slim
 
 # Настройка рабочей директории
@@ -21,6 +30,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем все файлы проекта в контейнер
 COPY . .
+
+# Подкладываем свежесобранный фронтенд в static, чтобы FastAPI отдавал актуальный UI
+COPY --from=frontend-builder /frontend/dist ./static
 
 # Создаем папки для логов и постоянных данных (Volume)
 RUN mkdir -p logs data

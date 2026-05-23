@@ -1,54 +1,71 @@
 import { Node, ApiResponse } from "./types";
 
-// In a real Telegram environment, we would use window.Telegram.WebApp.initData
-// We'll mock it for development
-const getInitData = () => {
+export const getInitData = (): string => {
     // @ts-ignore
-    if (typeof window !== 'undefined' && window.Telegram && window.Telegram.WebApp) {
+    if (typeof window !== "undefined" && window.Telegram && window.Telegram.WebApp) {
         // @ts-ignore
-        return window.Telegram.WebApp.initData || "mock_init_data";
+        return window.Telegram.WebApp.initData || "";
     }
-    return "mock_init_data";
+    return "";
 };
+
+export const isTelegramContext = (): boolean => Boolean(getInitData());
 
 const API_BASE = "/api";
 
+async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
+    const initData = getInitData();
+    if (!initData) {
+        throw new Error("Откройте панель через Telegram-бота: не найден Telegram initData.");
+    }
+
+    const headers: Record<string, string> = {
+        "X-Telegram-Init-Data": initData,
+        ...(init?.headers as Record<string, string> | undefined),
+    };
+    if (init?.body && !headers["Content-Type"]) {
+        headers["Content-Type"] = "application/json";
+    }
+
+    const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+    const contentType = res.headers.get("content-type") || "";
+    const isJson = contentType.includes("application/json");
+
+    if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        if (isJson) {
+            try {
+                const payload = await res.json();
+                detail = payload?.detail || payload?.message || detail;
+            } catch {
+                // ignore parse error
+            }
+        }
+        throw new Error(detail);
+    }
+
+    if (!isJson) {
+        throw new Error("Сервер вернул не-JSON ответ.");
+    }
+
+    return (await res.json()) as T;
+}
+
 export async function fetchNodes(): Promise<Node[]> {
     try {
-        const res = await fetch(`${API_BASE}/nodes`, {
-            headers: {
-                "X-Telegram-Init-Data": getInitData()
-            }
-        });
-        const contentType = res.headers.get("content-type");
-        if (!res.ok || (contentType && !contentType.includes("application/json"))) {
-            throw new Error("Failed to load nodes or invalid response format");
-        }
-        return await res.json();
+        return await apiRequest<Node[]>("/nodes");
     } catch (e) {
-        // Fallback to mock data for layout evaluation if the backend is not running
-        return [
-            { id: 1, ip: "192.168.1.10", role: "master", billing_date: "2026-06-01", status: "active", has_ssh_key: true },
-            { id: 2, ip: "192.168.1.11", role: "ingress", billing_date: "2026-06-15", status: "active", has_ssh_key: false },
-            { id: 3, ip: "192.168.1.12", role: "egress", billing_date: "2026-05-30", status: "offline", has_ssh_key: true },
-        ];
+        console.error(e);
+        return [];
     }
 }
 
 export async function addNode(payload: Omit<Node, 'id' | 'status' | 'has_ssh_key'> & { ssh_key?: string }): Promise<ApiResponse<null>> {
     try {
-        const res = await fetch(`${API_BASE}/nodes`, {
+        await apiRequest("/nodes", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "X-Telegram-Init-Data": getInitData()
-            },
             body: JSON.stringify(payload)
         });
-        const contentType = res.headers.get("content-type");
-        if (!res.ok || (contentType && !contentType.includes("application/json"))) {
-            return { success: false, error: "Backend not available in preview" };
-        }
         return { success: true };
     } catch (e) {
         console.error(e);
@@ -58,18 +75,10 @@ export async function addNode(payload: Omit<Node, 'id' | 'status' | 'has_ssh_key
 
 export async function applyHAProxyConfig(ip: string, config: string): Promise<ApiResponse<null>> {
     try {
-        const res = await fetch(`${API_BASE}/haproxy/apply`, {
+        await apiRequest("/haproxy/apply", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "X-Telegram-Init-Data": getInitData()
-            },
-            body: JSON.stringify({ ip, config })
+            body: JSON.stringify({ ip, config_content: config })
         });
-        const contentType = res.headers.get("content-type");
-        if (!res.ok || (contentType && !contentType.includes("application/json"))) {
-            return { success: false, error: "Backend not available in preview" };
-        }
         return { success: true };
     } catch (e) {
         console.error(e);
@@ -79,79 +88,40 @@ export async function applyHAProxyConfig(ip: string, config: string): Promise<Ap
 
 export async function fetchMarzbanStats(): Promise<any> {
     try {
-        const res = await fetch(`${API_BASE}/marzban/stats`, {
-            headers: {
-                "X-Telegram-Init-Data": getInitData()
-            }
-        });
-        const contentType = res.headers.get("content-type");
-        if (!res.ok || (contentType && !contentType.includes("application/json"))) {
-            throw new Error("Invalid response");
-        }
-        return await res.json();
+        return await apiRequest("/marzban/stats");
     } catch (e) {
+        console.error(e);
         return {
-            anomalies: [
-                { id: 1, text: "High traffic spike detected on Node Ingress-04 (IP: 91.201.33.88)", severity: "high" },
-                { id: 2, text: "Unusual connection count on Egress-1 (IP: 5.2.44.101)", severity: "medium" }
-            ],
-            top_users: [
-                { username: "client_alpha", traffic: "1.2 TB", status: "active" },
-                { username: "client_beta", traffic: "850 GB", status: "active" },
-                { username: "test_user1", traffic: "450 GB", status: "limited" }
-            ]
+            anomalies: [],
+            top_users: []
         };
     }
 }
 
 export async function fetchSecurityAudit(): Promise<any> {
     try {
-        const res = await fetch(`${API_BASE}/security/audit`, {
-            headers: {
-                "X-Telegram-Init-Data": getInitData()
-            }
-        });
-        const contentType = res.headers.get("content-type");
-        if (!res.ok || (contentType && !contentType.includes("application/json"))) {
-            throw new Error("Invalid response");
-        }
-        return await res.json();
+        return await apiRequest("/security/audit");
     } catch (e) {
+        console.error(e);
         return {
-            banned_ips: [
-                { ip: "198.51.100.14", reason: "Decoy bruteforce (>20 requests)", date: "2026-05-22 14:12 UTC" },
-                { ip: "203.0.113.88", reason: "SSH brute force detected", date: "2026-05-22 11:45 UTC" }
-            ],
-            ssh_logins: [
-                { ip: "Admin", target: "185.244.11.02", status: "Accepted", date: "2026-05-22 15:10 UTC" },
-                { ip: "Unknown", target: "45.88.2.143", status: "Rejected", date: "2026-05-22 14:55 UTC" }
-            ]
+            banned_ips: [],
+            ssh_logins: []
         };
     }
 }
 
 export async function executeSysinfo(ip: string): Promise<string[]> {
     try {
-        const res = await fetch(`${API_BASE}/sysinfo`, {
+        const data = await apiRequest<{ logs: string[] }>("/sysinfo", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "X-Telegram-Init-Data": getInitData()
-            },
             body: JSON.stringify({ ip })
         });
-        const contentType = res.headers.get("content-type");
-        if (!res.ok || (contentType && !contentType.includes("application/json"))) {
-            throw new Error("Invalid response");
-        }
-        const data = await res.json();
         return data.logs;
     } catch (e) {
+        console.error(e);
         return [
-            `[INFO] Connecting to ${ip}:2222... Authentication successful.`,
-            `UPTIME: 14 days, 3:12 | LOAD: 0.15, 0.08, 0.02`,
-            `DISK: /dev/sda1 40% full (12GB free)`,
-            `RAM: 1.2GB / 2.0GB in use`
+            `[ERROR] Не удалось получить sysinfo для ${ip}`,
+            String(e),
         ];
     }
 }
