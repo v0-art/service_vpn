@@ -1,4 +1,5 @@
 import logging
+from urllib.parse import urlencode
 from aiogram import Router, types
 from aiogram.filters import CommandStart, Command
 
@@ -36,6 +37,13 @@ async def cmd_start(message: types.Message) -> None:
             parse_mode="HTML",
         )
         return
+
+    # Cache-buster для Telegram WebApp: позволяет принудительно обновлять фронтенд
+    # без смены домена (задаем WEB_APP_VERSION в .env)
+    web_app_version = config.WEB_APP_VERSION.strip()
+    if web_app_version:
+        sep = "&" if "?" in web_app_url else "?"
+        web_app_url = f"{web_app_url}{sep}{urlencode({'v': web_app_version})}"
     
     markup = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🎛 Открыть Control Tower", web_app=WebAppInfo(url=web_app_url))]],
