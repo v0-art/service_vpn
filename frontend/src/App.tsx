@@ -84,11 +84,11 @@ export default function App() {
     tg?.expand?.();
 
     if (!inTelegram) {
-      setWarning('Панель доступна только через кнопку в Telegram-боте. Внешний вход ограничен.');
-    } else {
-      setWarning(null);
+      setWarning('404 Not Found');
+      return;
     }
 
+    setWarning(null);
     refreshAll();
   }, [inTelegram]);
 
@@ -104,6 +104,20 @@ export default function App() {
   const marzbanConnected = Boolean(overview?.marzban_connected);
   const sshReachable = overview?.ssh_reachable ?? 0;
   const activeNodesCount = overview?.nodes_active ?? 0;
+
+  if (!inTelegram) {
+    return (
+      <div className="min-h-screen w-full bg-app-bg text-app-text flex items-center justify-center">
+        <div className="bg-app-card border border-app-border rounded-lg p-8 text-center max-w-md">
+          <div className="text-5xl font-extrabold text-app-danger mb-3">404</div>
+          <div className="text-sm font-semibold mb-2">Страница не найдена</div>
+          <div className="text-xs text-app-muted">
+            Панель открывается только через кнопку в Telegram-боте.
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen w-full bg-app-bg text-app-text">

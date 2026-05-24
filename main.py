@@ -4,8 +4,7 @@ import os
 from logging.handlers import RotatingFileHandler
 import uvicorn
 from aiogram import Bot, Dispatcher
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi import FastAPI
 from bot.handlers import router
 from fastapi.staticfiles import StaticFiles
 from web.api import router as api_router
@@ -38,41 +37,6 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="LUFFY Control Tower API", version="2.6")
 # Подключаем API роутер
 app.include_router(api_router)
-
-
-def _is_telegram_webapp_request(request: Request) -> bool:
-    """
-    Минимальная серверная проверка, что UI открывают из Telegram WebApp.
-    """
-    user_agent = request.headers.get("user-agent", "")
-    referer = request.headers.get("referer", "")
-    query = request.query_params
-
-    has_telegram_user_agent = "Telegram" in user_agent
-    has_telegram_query_markers = any(
-        marker in query
-        for marker in ("tgWebAppData", "tgWebAppVersion", "tgWebAppPlatform", "tgWebAppThemeParams")
-    )
-    has_telegram_referer = "telegram.org" in referer or "t.me" in referer
-
-    return has_telegram_user_agent or has_telegram_query_markers or has_telegram_referer
-
-
-@app.middleware("http")
-async def restrict_external_panel_access(request: Request, call_next) -> Response:
-    """
-    Блокирует публичный внешний вход в Mini App UI.
-    API и /health остаются доступны для штатной работы.
-    """
-    path = request.url.path
-
-    if path.startswith("/api") or path == "/health":
-        return await call_next(request)
-
-    if _is_telegram_webapp_request(request):
-        return await call_next(request)
-
-    return PlainTextResponse("404 Not Found", status_code=404)
 
 @app.get("/health")
 async def health_check() -> dict[str, str]:
