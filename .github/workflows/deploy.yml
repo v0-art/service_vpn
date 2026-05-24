@@ -20,8 +20,24 @@ jobs:
             # Переходим в рабочую папку на сервере (замените путь на свой, если он отличается)
             cd /root/service_vpn
             
-            # Подтягиваем последние изменения
-            git pull origin main
+            # Сохраняем серверный .env (он локальный и не должен ломать git-обновление)
+            if [ -f .env ]; then
+              cp .env /tmp/service_vpn.env.backup
+            fi
+
+            # Приводим tracked-файлы к точному состоянию origin/main
+            # Это защищает CD от падения вида:
+            # "Your local changes would be overwritten by merge"
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Возвращаем серверный .env после обновления кода
+            if [ -f /tmp/service_vpn.env.backup ]; then
+              cp /tmp/service_vpn.env.backup .env
+            fi
+
+            # Гарантируем наличие runtime-директорий
+            mkdir -p logs data
             
             # Пересобираем и запускаем контейнеры в Docker
             docker compose down
