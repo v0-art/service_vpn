@@ -75,6 +75,45 @@ class MarzbanManager:
             logger.error(f"Сетевая ошибка при запросе пользователей Marzban: {e}")
             return[]
 
+    async def get_connection_status(self) -> Dict[str, Any]:
+        """
+        Проверяет доступность Marzban API и возвращает базовую информацию о соединении.
+        """
+        if not await self._authenticate():
+            return {
+                "connected": False,
+                "users_count": 0,
+                "error": "Ошибка авторизации в Marzban API.",
+            }
+
+        url = f"{self.base_url}/api/users"
+        headers = {"Authorization": f"Bearer {self.token}", "accept": "application/json"}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=ClientTimeout(total=15)) as response:
+                    if response.status != 200:
+                        return {
+                            "connected": False,
+                            "users_count": 0,
+                            "error": f"HTTP {response.status}",
+                        }
+
+                    payload = await response.json()
+                    users_count = len(payload) if isinstance(payload, list) else 0
+                    return {
+                        "connected": True,
+                        "users_count": users_count,
+                        "error": None,
+                    }
+        except Exception as e:
+            logger.error(f"Сетевая ошибка при проверке Marzban API: {e}")
+            return {
+                "connected": False,
+                "users_count": 0,
+                "error": str(e),
+            }
+
     async def check_traffic_anomalies(self, bot: Bot) -> None:
         """
         Проверяет трафик пользователей. Если кто-то скачал больше ANOMALY_THRESHOLD_BYTES

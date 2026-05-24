@@ -1,4 +1,4 @@
-import { Node, ApiResponse } from "./types";
+import { Node, ApiResponse, SystemOverview } from "./types";
 
 export const getInitData = (): string => {
     // @ts-ignore
@@ -60,16 +60,37 @@ export async function fetchNodes(): Promise<Node[]> {
     }
 }
 
-export async function addNode(payload: Omit<Node, 'id' | 'status' | 'has_ssh_key'> & { ssh_key?: string }): Promise<ApiResponse<null>> {
+export async function addNode(
+    payload: Omit<Node, "id" | "status" | "has_ssh_key"> & { ssh_key?: string }
+): Promise<ApiResponse<{ message?: string }>> {
     try {
-        await apiRequest("/nodes", {
+        const data = await apiRequest<{ status: string; message?: string }>("/nodes", {
             method: "POST",
             body: JSON.stringify(payload)
         });
-        return { success: true };
+        return { success: true, data: { message: data?.message } };
     } catch (e) {
         console.error(e);
         return { success: false, error: String(e) };
+    }
+}
+
+export async function fetchSystemOverview(): Promise<SystemOverview> {
+    try {
+        return await apiRequest<SystemOverview>("/status/overview");
+    } catch (e) {
+        console.error(e);
+        return {
+            timestamp: Math.floor(Date.now() / 1000),
+            nodes_total: 0,
+            nodes_active: 0,
+            ssh_reachable: 0,
+            ssh_unreachable: 0,
+            marzban_connected: false,
+            marzban_users_count: 0,
+            marzban_error: String(e),
+            nodes: [],
+        };
     }
 }
 

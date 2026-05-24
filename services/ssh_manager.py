@@ -34,17 +34,21 @@ class SSHManager:
         """
         target_user = user or self.default_user
         
-        # Получаем индивидуальный SSH-ключ для этого хоста из БД, если он есть
+        # Получаем индивидуальные SSH-параметры для этого хоста из БД, если они есть
         ssh_key_content: Optional[str] = None
+        target_port: int = self.port
         try:
             from db.database import get_db_connection
             async with get_db_connection() as db:
-                async with db.execute("SELECT ssh_key FROM nodes WHERE ip = ?", (host,)) as cursor:
+                async with db.execute("SELECT ssh_key, ssh_port FROM nodes WHERE ip = ?", (host,)) as cursor:
                     row = await cursor.fetchone()
-                    if row and row["ssh_key"]:
-                        ssh_key_content = row["ssh_key"]
+                    if row:
+                        if row["ssh_key"]:
+                            ssh_key_content = row["ssh_key"]
+                        if row["ssh_port"]:
+                            target_port = int(row["ssh_port"])
         except Exception as e:
-            logger.error(f"Не удалось получить индивидуальный SSH-ключ для {host} из БД: {e}")
+            logger.error(f"Не удалось получить SSH-параметры для {host} из БД: {e}")
 
         client_keys: Any = []
         if ssh_key_content:
@@ -63,7 +67,7 @@ class SSHManager:
             # Для динамического кластера VPN это необходимо.
             async with asyncssh.connect(
                 host, 
-                port=self.port,
+                port=target_port,
                 username=target_user, 
                 client_keys=client_keys, 
                 known_hosts=None

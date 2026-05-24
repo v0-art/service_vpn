@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -7,7 +8,7 @@ import time
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
 from config import config
@@ -147,6 +148,7 @@ class NodeCreate(BaseModel):
     role: str
     billing_date: str
     ssh_key: Optional[str] = None
+    ssh_port: int = Field(default=config.SSH_PORT, ge=1, le=65535)
 
 class HAProxyUpdate(BaseModel):
     ip: str
@@ -166,7 +168,9 @@ async def get_nodes() -> List[Dict[str, Any]]:
     """Получение списка всех серверов кластера."""
     try:
         async with get_db_connection() as db:
-            async with db.execute("SELECT id, ip, role, billing_date, status, ssh_key FROM nodes") as cursor:
+            async with db.execute(
+                "SELECT id, ip, role, billing_date, status, ssh_key, ssh_port FROM nodes"
+            ) as cursor:
                 rows = await cursor.fetchall()
                 result = []
                 for row in rows:
@@ -193,14 +197,91 @@ async def add_node(node: NodeCreate) -> Dict[str, str]:
 
         async with get_db_connection() as db:
             await db.execute(
-                "INSERT INTO nodes (ip, role, billing_date, ssh_key) VALUES (?, ?, ?, ?)",
-                (node.ip, node.role, node.billing_date, final_ssh_key)
+                "INSERT INTO nodes (ip, role, billing_date, ssh_key, ssh_port) VALUES (?, ?, ?, ?, ?)",
+                (node.ip, node.role, node.billing_date, final_ssh_key, node.ssh_port),
             )
             await db.commit()
-        return {"status": "success", "message": f"Нода {node.ip} добавлена."}
+        return {
+            "status": "success",
+            "message": f"Сервер {node.ip}:{node.ssh_port} успешно добавлен в инвентарь.",
+        }
     except Exception as e:
         logger.error(f"Ошибка при добавлении ноды {node.ip}: {e}")
         raise HTTPException(status_code=400, detail="Ошибка при добавлении (возможно IP уже существует)")
+
+
+@router.get("/status/overview")
+async def get_status_overview() -> Dict[str, Any]:
+    """
+    Сводный статус панели:
+    - доступность Marzban
+    - фактическая SSH-связность с нодами
+    """
+    async with get_db_connection() as db:
+        async with db.execute(
+            "SELECT id, ip, role, status, ssh_port FROM nodes ORDER BY id ASC"
+        ) as cursor:
+            nodes_rows = await cursor.fetchall()
+
+    nodes = [dict(row) for row in nodes_rows]
+    nodes_total = len(nodes)
+    nodes_active = len([node for node in nodes if node.get("status") == "active"])
+
+    marzban_status = await marzban_manager.get_connection_status()
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def check_node_connection(node: Dict[str, Any]) -> Dict[str, Any]:
+        node_ip = str(node.get("ip", ""))
+        node_status = str(node.get("status", "offline"))
+        node_port = int(node.get("ssh_port") or config.SSH_PORT)
+
+        if node_status != "active":
+            return {
+                "id": node.get("id"),
+                "ip": node_ip,
+                "role": node.get("role"),
+                "status": node_status,
+                "ssh_port": node_port,
+                "checked": False,
+                "connected": False,
+                "error": "Сервер помечен как неактивный.",
+            }
+
+        async with semaphore:
+            success, output = await ssh_manager.execute_command(
+                node_ip,
+                "echo LUFFY_OK",
+                timeout=8,
+            )
+
+        return {
+            "id": node.get("id"),
+            "ip": node_ip,
+            "role": node.get("role"),
+            "status": node_status,
+            "ssh_port": node_port,
+            "checked": True,
+            "connected": bool(success and "LUFFY_OK" in output),
+            "error": None if success else output,
+        }
+
+    checked_nodes = await asyncio.gather(*(check_node_connection(node) for node in nodes))
+    checked_active_nodes = [node for node in checked_nodes if node["checked"]]
+    ssh_reachable = len([node for node in checked_active_nodes if node["connected"]])
+    ssh_unreachable = len(checked_active_nodes) - ssh_reachable
+
+    return {
+        "timestamp": int(time.time()),
+        "nodes_total": nodes_total,
+        "nodes_active": nodes_active,
+        "ssh_reachable": ssh_reachable,
+        "ssh_unreachable": ssh_unreachable,
+        "marzban_connected": bool(marzban_status.get("connected")),
+        "marzban_users_count": int(marzban_status.get("users_count", 0)),
+        "marzban_error": marzban_status.get("error"),
+        "nodes": checked_nodes,
+    }
 
 @router.post("/haproxy/apply")
 async def apply_haproxy_config(data: HAProxyUpdate) -> Dict[str, str]:
