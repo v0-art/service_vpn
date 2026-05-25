@@ -1,4 +1,4 @@
-import { Node, ApiResponse, SystemOverview } from "./types";
+import { Node, ApiResponse, SystemOverview, NodeUpdatePayload } from "./types";
 
 export const getInitData = (): string => {
     // @ts-ignore
@@ -67,6 +67,19 @@ export async function addNode(
         const data = await apiRequest<{ status: string; message?: string }>("/nodes", {
             method: "POST",
             body: JSON.stringify(payload)
+        });
+        return { success: true, data: { message: data?.message } };
+    } catch (e) {
+        console.error(e);
+        return { success: false, error: String(e) };
+    }
+}
+
+export async function updateNode(nodeId: number, payload: NodeUpdatePayload): Promise<ApiResponse<{ message?: string }>> {
+    try {
+        const data = await apiRequest<{ status: string; message?: string }>(`/nodes/${nodeId}`, {
+            method: "PUT",
+            body: JSON.stringify(payload),
         });
         return { success: true, data: { message: data?.message } };
     } catch (e) {

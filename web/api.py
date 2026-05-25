@@ -150,6 +150,15 @@ class NodeCreate(BaseModel):
     ssh_key: Optional[str] = None
     ssh_port: int = Field(default=config.SSH_PORT, ge=1, le=65535)
 
+
+class NodeUpdate(BaseModel):
+    ip: Optional[str] = None
+    role: Optional[str] = None
+    billing_date: Optional[str] = None
+    ssh_key: Optional[str] = None
+    ssh_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    status: Optional[str] = None
+
 class HAProxyUpdate(BaseModel):
     ip: str
     config_content: Optional[str] = None
@@ -208,6 +217,75 @@ async def add_node(node: NodeCreate) -> Dict[str, str]:
     except Exception as e:
         logger.error(f"Ошибка при добавлении ноды {node.ip}: {e}")
         raise HTTPException(status_code=400, detail="Ошибка при добавлении (возможно IP уже существует)")
+
+
+@router.put("/nodes/{node_id}")
+async def update_node(node_id: int, node: NodeUpdate) -> Dict[str, str]:
+    """
+    Редактирование параметров существующей ноды.
+    Позволяет обновлять IP, роль, дату оплаты, SSH-порт, статус и (опционально) SSH-ключ.
+    """
+    payload = node.model_dump(exclude_unset=True)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Нет данных для обновления.")
+
+    allowed_roles = {"master", "ingress", "egress"}
+    allowed_statuses = {"active", "offline"}
+
+    if "role" in payload and payload["role"] not in allowed_roles:
+        raise HTTPException(status_code=400, detail="Некорректная роль ноды.")
+
+    if "status" in payload and payload["status"] not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="Некорректный статус ноды.")
+
+    try:
+        async with get_db_connection() as db:
+            async with db.execute(
+                "SELECT id, ip, role, billing_date, ssh_key, ssh_port, status FROM nodes WHERE id = ?",
+                (node_id,),
+            ) as cursor:
+                existing = await cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(status_code=404, detail="Сервер не найден.")
+
+            merged = dict(existing)
+
+            for key, value in payload.items():
+                if key == "ssh_key":
+                    # Пустой ключ не перезаписывает существующий
+                    if value is None:
+                        continue
+                    if isinstance(value, str) and not value.strip():
+                        continue
+                    merged["ssh_key"] = value
+                else:
+                    merged[key] = value
+
+            await db.execute(
+                """
+                UPDATE nodes
+                SET ip = ?, role = ?, billing_date = ?, ssh_key = ?, ssh_port = ?, status = ?
+                WHERE id = ?
+                """,
+                (
+                    merged["ip"],
+                    merged["role"],
+                    merged["billing_date"],
+                    merged["ssh_key"],
+                    int(merged["ssh_port"]),
+                    merged["status"],
+                    node_id,
+                ),
+            )
+            await db.commit()
+
+        return {"status": "success", "message": f"Параметры сервера {merged['ip']} обновлены."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Ошибка при обновлении ноды id=%s: %s", node_id, e)
+        raise HTTPException(status_code=400, detail="Не удалось обновить сервер (проверьте уникальность IP).")
 
 
 @router.get("/status/overview")

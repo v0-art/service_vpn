@@ -8,6 +8,15 @@ export interface Node {
   ssh_port: number;
 }
 
+export interface NodeUpdatePayload {
+  ip?: string;
+  role?: 'master' | 'ingress' | 'egress';
+  billing_date?: string;
+  ssh_key?: string;
+  ssh_port?: number;
+  status?: 'active' | 'offline';
+}
+
 export interface NodeConnectionStatus {
   id: number;
   ip: string;
