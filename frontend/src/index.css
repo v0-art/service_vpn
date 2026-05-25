@@ -23,3 +23,8 @@ html, body {
 body {
   @apply bg-app-bg text-app-text font-sans;
 }
+
+.app-shell {
+  --app-zoom: 1;
+  zoom: var(--app-zoom);
+}

@@ -61,6 +61,13 @@ function normalizeError(error: string): string {
   return error.replace(/^Error:\s*/i, '').trim();
 }
 
+function calculateAppScale(width: number, height: number): number {
+  const widthScale = width / 430;
+  const heightScale = height / 900;
+  const rawScale = Math.min(widthScale, heightScale);
+  return Number(Math.max(0.9, Math.min(1.08, rawScale)).toFixed(3));
+}
+
 function updateConnectionLabel(node: AppNode, connection?: NodeConnectionStatus) {
   if (!connection) {
     return {
@@ -139,6 +146,7 @@ export default function App() {
   const [overview, setOverview] = useState<SystemOverview | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [editingNode, setEditingNode] = useState<AppNode | null>(null);
+  const [appScale, setAppScale] = useState(1);
 
   const inTelegram = isTelegramContext();
 
@@ -180,6 +188,24 @@ export default function App() {
     refreshAll();
   }, [inTelegram]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const onResize = () => {
+      setAppScale(calculateAppScale(window.innerWidth, window.innerHeight));
+    };
+
+    onResize();
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+    };
+  }, []);
+
   const connectionByIp = useMemo(() => {
     const map = new Map<string, NodeConnectionStatus>();
     for (const node of overview?.nodes || []) {
@@ -206,7 +232,10 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen w-full bg-app-bg text-app-text">
+    <div
+      className="app-shell flex h-screen w-full bg-app-bg text-app-text"
+      style={{ ['--app-zoom' as '--app-zoom']: appScale }}
+    >
       <aside className="hidden md:flex w-[220px] shrink-0 border-r border-app-border flex-col bg-app-card/50">
         <div className="p-6 border-b border-app-border">
           <div className="font-extrabold text-[18px] tracking-[1px] flex items-center gap-2.5 text-app-accent">

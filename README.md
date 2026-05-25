@@ -74,6 +74,11 @@
 - в `.env` задан корректный `WEB_APP_URL` с `https://`;
 - `ADMIN_ID` соответствует вашему Telegram ID.
 
+### Marzban не подключается (ошибка авторизации)
+Если в `MARZBAN_USERNAME` или `MARZBAN_PASSWORD` есть спецсимволы (`#`, `&`, `!`, `*`), задавайте их в кавычках:
+- `MARZBAN_USERNAME=\"G72#nT...\"`
+- `MARZBAN_PASSWORD=\"v8#R&k29!PzQ*5....\"`
+
 ### Сервер недоступен по SSH
 Проверьте:
 - правильный SSH порт;
