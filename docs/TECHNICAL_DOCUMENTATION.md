@@ -76,11 +76,21 @@
 ### 5.1 Таблица `nodes`
 Поля:
 - `id` (PK, autoincrement);
+- `name` (display name);
 - `ip` (unique, not null);
 - `role` (`master`, `ingress`, `egress`);
 - `billing_date` (`YYYY-MM-DD`);
 - `status` (`active`/`offline`, default `active`);
-- `ssh_key` (private key ноды, может быть `NULL`).
+- `ssh_key` (private key ноды, может быть `NULL`);
+- `ssh_port` (SSH порт);
+- `inbound_tag` (одна из групп: `IN-RU-DIRECT`, `IN-EU-DIRECT`, `IN-TRANSIT-GB`, `IN-TRANSIT-NO`, `IN-EU-TRANSIT-RECV`, `IN-EU-DIRECT-WARP`);
+- `inbound_port` (порт подключения узла в группе);
+- `group_sni` (SNI группы);
+- `fingerprint` (клиентский fingerprint);
+- `marzban_node_id` (id ноды в Marzban, если зарегистрирована);
+- `marzban_node_status` (`unknown`/`connected`/`error`);
+- `marzban_last_error` (последняя ошибка Marzban);
+- `provision_status` (`pending`/`provisioning`/`ready`/`error`).
 
 ### 5.2 Таблица `settings`
 Простое key-value хранилище:
@@ -102,9 +112,24 @@
   - возвращает список нод;
   - `ssh_key` не отдается наружу (заменяется флагом `has_ssh_key`).
 - `POST /api/nodes`
-  - добавляет ноду;
+  - добавляет ноду в инвентарь;
   - если `ssh_key` пуст, генерируется новый RSA private key;
-  - дубликат IP вернет ошибку `400`.
+  - запускает pipeline: (опционально) bootstrap новой ноды -> add node в Marzban -> attach в выбранную inbound-группу;
+  - при частичном успехе возвращает `status=partial` с текстом причины.
+- `PUT /api/nodes/{node_id}`
+  - редактирует параметры подключения и бизнес-поля;
+  - при `reconnect_marzban=true` выполняет перепривязку к Marzban/inbound после обновления.
+- `DELETE /api/nodes/{node_id}`
+  - удаляет ноду из панели;
+  - удаляет host/node из Marzban;
+  - выполняет cleanup на удаленной ноде по SSH (опционально флагом).
+- `GET /api/status/overview`
+  - агрегирует состояние Marzban и SSH доступность всех нод;
+  - возвращает `marzban_error_code` (`auth_401`, `auth_403`, `network`, `http_error`).
+- `GET /api/marzban/connection`
+  - явная проверка соединения с Marzban.
+- `POST /api/marzban/reconnect`
+  - принудительный сброс токена и повторная авторизация.
 - `POST /api/haproxy/apply`
   - применяет новый конфиг HAProxy на целевой ноде;
   - выполняет валидацию `haproxy -c`, backup, restart и rollback при сбое.
@@ -191,17 +216,25 @@ GitHub Actions workflow `Deploy Control Tower`:
 
 ### 11.1 Добавление сервера через Mini App
 1. Открыть Mini App только кнопкой из `/start`.
-2. В форме «Добавить сервер» указать `IP`, `role`, `billing_date`.
+2. В форме «Добавить сервер» указать:
+   - `name`, `IP`, `role`, `ssh_port`, `billing_date`;
+   - `inbound_tag`, `inbound_port`, `group_sni`, `fingerprint`;
+   - флаг `Сервер новый` при необходимости bootstrap.
 3. Поле SSH ключа оставить пустым для автогенерации или вставить свой.
-4. Нажать «Добавить сервер».
+4. Нажать «Добавить сервер» и дождаться результата pipeline.
 
-### 11.2 Применение нового `haproxy.cfg`
+### 11.2 Удаление сервера
+1. В инвентаре нажать `Удалить`.
+2. Подтвердить удаление.
+3. Сервис удалит ноду из панели, Marzban и выполнит cleanup на удаленной ноде.
+
+### 11.3 Применение нового `haproxy.cfg`
 1. Вставить IP целевой ноды.
 2. Вставить новый конфиг.
 3. Нажать «Проверить и Задеплоить».
 4. При синтаксической ошибке конфиг не применяется, возвращается текст ошибки.
 
-### 11.3 Диагностика health
+### 11.4 Диагностика health
 ```bash
 docker compose ps
 docker compose logs --tail=200 control-tower

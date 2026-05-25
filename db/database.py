@@ -1,7 +1,6 @@
 import os
 import aiosqlite
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +38,21 @@ async def init_db() -> None:
                 f'''
                 CREATE TABLE IF NOT EXISTS nodes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
                     ip TEXT UNIQUE NOT NULL,
                     role TEXT NOT NULL, -- master, ingress, egress
                     billing_date TEXT NOT NULL,
                     status TEXT DEFAULT 'active',
                     ssh_key TEXT,
-                    ssh_port INTEGER NOT NULL DEFAULT {DEFAULT_SSH_PORT}
+                    ssh_port INTEGER NOT NULL DEFAULT {DEFAULT_SSH_PORT},
+                    inbound_tag TEXT,
+                    inbound_port INTEGER,
+                    group_sni TEXT,
+                    fingerprint TEXT,
+                    marzban_node_id INTEGER,
+                    marzban_node_status TEXT DEFAULT 'unknown',
+                    marzban_last_error TEXT,
+                    provision_status TEXT DEFAULT 'pending'
                 )
                 '''
             )
@@ -57,23 +65,26 @@ async def init_db() -> None:
                 )
             ''')
             
-            # Автоматическая миграция для добавления колонки ssh_key, если её нет
-            try:
-                await db.execute("ALTER TABLE nodes ADD COLUMN ssh_key TEXT")
-                await db.commit()
-                logger.info("Успешно добавлена колонка ssh_key в таблицу nodes.")
-            except aiosqlite.OperationalError:
-                # Колонка уже существует, игнорируем ошибку
-                pass
+            async def ensure_column(column_sql: str, column_name: str) -> None:
+                try:
+                    await db.execute(f"ALTER TABLE nodes ADD COLUMN {column_sql}")
+                    await db.commit()
+                    logger.info("Успешно добавлена колонка %s в таблицу nodes.", column_name)
+                except aiosqlite.OperationalError:
+                    pass
 
-            # Автоматическая миграция для добавления колонки ssh_port, если её нет
-            try:
-                await db.execute(f"ALTER TABLE nodes ADD COLUMN ssh_port INTEGER NOT NULL DEFAULT {DEFAULT_SSH_PORT}")
-                await db.commit()
-                logger.info("Успешно добавлена колонка ssh_port в таблицу nodes.")
-            except aiosqlite.OperationalError:
-                # Колонка уже существует, игнорируем ошибку
-                pass
+            # Автоматические миграции для старых инсталляций
+            await ensure_column("name TEXT", "name")
+            await ensure_column("ssh_key TEXT", "ssh_key")
+            await ensure_column(f"ssh_port INTEGER NOT NULL DEFAULT {DEFAULT_SSH_PORT}", "ssh_port")
+            await ensure_column("inbound_tag TEXT", "inbound_tag")
+            await ensure_column("inbound_port INTEGER", "inbound_port")
+            await ensure_column("group_sni TEXT", "group_sni")
+            await ensure_column("fingerprint TEXT", "fingerprint")
+            await ensure_column("marzban_node_id INTEGER", "marzban_node_id")
+            await ensure_column("marzban_node_status TEXT DEFAULT 'unknown'", "marzban_node_status")
+            await ensure_column("marzban_last_error TEXT", "marzban_last_error")
+            await ensure_column("provision_status TEXT DEFAULT 'pending'", "provision_status")
 
             # Нормализуем ssh_port для уже существующих записей
             try:
@@ -84,6 +95,31 @@ async def init_db() -> None:
                 await db.commit()
             except aiosqlite.OperationalError:
                 # На случай нестандартной старой схемы
+                pass
+
+            # Нормализуем дополнительные поля
+            try:
+                await db.execute("UPDATE nodes SET name = ip WHERE name IS NULL OR name = ''")
+                await db.execute(
+                    "UPDATE nodes SET inbound_tag = 'IN-RU-DIRECT' WHERE inbound_tag IS NULL OR inbound_tag = ''"
+                )
+                await db.execute(
+                    "UPDATE nodes SET inbound_port = 443 WHERE inbound_port IS NULL OR inbound_port <= 0"
+                )
+                await db.execute(
+                    "UPDATE nodes SET group_sni = ip WHERE group_sni IS NULL OR group_sni = ''"
+                )
+                await db.execute(
+                    "UPDATE nodes SET fingerprint = 'chrome' WHERE fingerprint IS NULL OR fingerprint = ''"
+                )
+                await db.execute(
+                    "UPDATE nodes SET provision_status = 'pending' WHERE provision_status IS NULL OR provision_status = ''"
+                )
+                await db.execute(
+                    "UPDATE nodes SET marzban_node_status = 'unknown' WHERE marzban_node_status IS NULL OR marzban_node_status = ''"
+                )
+                await db.commit()
+            except aiosqlite.OperationalError:
                 pass
             
             await db.commit()

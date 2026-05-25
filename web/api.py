@@ -5,14 +5,16 @@ import json
 import logging
 import re
 import time
+from typing import List, Dict, Any, Optional
 from urllib.parse import parse_qsl
 
+import asyncssh
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
 
 from config import config
 from db.database import get_db_connection
+from services.deployer import deployer
 from services.haproxy_manager import haproxy_manager
 from services.marzban import marzban_manager
 from services.ssh_manager import ssh_manager
@@ -20,6 +22,17 @@ from services.ssh_manager import ssh_manager
 logger = logging.getLogger(__name__)
 
 TELEGRAM_INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60
+
+ALLOWED_ROLES = {"master", "ingress", "egress"}
+ALLOWED_NODE_STATUSES = {"active", "offline"}
+ALLOWED_INBOUND_TAGS = {
+    "IN-RU-DIRECT",
+    "IN-EU-DIRECT",
+    "IN-TRANSIT-GB",
+    "IN-TRANSIT-NO",
+    "IN-EU-TRANSIT-RECV",
+    "IN-EU-DIRECT-WARP",
+}
 
 
 def _validate_telegram_init_data(init_data: str) -> Dict[str, Any]:
@@ -142,35 +155,63 @@ router = APIRouter(
     dependencies=[Depends(require_telegram_admin)],
 )
 
-# --- Pydantic Модели ---
+
 class NodeCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=64)
     ip: str
     role: str
     billing_date: str
     ssh_key: Optional[str] = None
     ssh_port: int = Field(default=config.SSH_PORT, ge=1, le=65535)
+    inbound_tag: str
+    inbound_port: int = Field(ge=1, le=65535)
+    group_sni: str = Field(min_length=2, max_length=255)
+    fingerprint: str = Field(min_length=2, max_length=32)
+    is_new_server: bool = False
 
 
 class NodeUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2, max_length=64)
     ip: Optional[str] = None
     role: Optional[str] = None
     billing_date: Optional[str] = None
     ssh_key: Optional[str] = None
     ssh_port: Optional[int] = Field(default=None, ge=1, le=65535)
     status: Optional[str] = None
+    inbound_tag: Optional[str] = None
+    inbound_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    group_sni: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    fingerprint: Optional[str] = Field(default=None, min_length=2, max_length=32)
+    reconnect_marzban: bool = False
+
+
+class NodeDeleteRequest(BaseModel):
+    cleanup_remote: bool = True
+
 
 class HAProxyUpdate(BaseModel):
     ip: str
     config_content: Optional[str] = None
-    # Backward compatibility with the current frontend bundle:
-    # it sends "config" instead of "config_content".
+    # Backward compatibility with current frontend bundle.
     config: Optional[str] = None
 
 
 class SysinfoRequest(BaseModel):
     ip: str
 
-# --- Эндпоинты ---
+
+def _validate_node_role(role: str) -> None:
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(status_code=400, detail="Некорректная роль ноды.")
+
+
+def _validate_inbound_tag(tag: str) -> None:
+    if tag not in ALLOWED_INBOUND_TAGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Некорректная группа inbound: {tag}",
+        )
+
 
 @router.get("/nodes", response_model=List[Dict[str, Any]])
 async def get_nodes() -> List[Dict[str, Any]]:
@@ -178,70 +219,146 @@ async def get_nodes() -> List[Dict[str, Any]]:
     try:
         async with get_db_connection() as db:
             async with db.execute(
-                "SELECT id, ip, role, billing_date, status, ssh_key, ssh_port FROM nodes"
+                """
+                SELECT
+                    id, name, ip, role, billing_date, status,
+                    ssh_key, ssh_port,
+                    inbound_tag, inbound_port, group_sni, fingerprint,
+                    marzban_node_id, marzban_node_status, marzban_last_error,
+                    provision_status
+                FROM nodes
+                ORDER BY id DESC
+                """
             ) as cursor:
                 rows = await cursor.fetchall()
                 result = []
                 for row in rows:
                     node_dict = dict(row)
-                    # Скрываем приватный ключ в целях безопасности
+                    node_dict["name"] = node_dict.get("name") or node_dict.get("ip")
+                    node_dict["inbound_tag"] = node_dict.get("inbound_tag") or "IN-RU-DIRECT"
+                    node_dict["inbound_port"] = int(node_dict.get("inbound_port") or 443)
+                    node_dict["group_sni"] = node_dict.get("group_sni") or node_dict.get("ip")
+                    node_dict["fingerprint"] = node_dict.get("fingerprint") or "chrome"
+                    node_dict["provision_status"] = node_dict.get("provision_status") or "pending"
+                    node_dict["marzban_node_status"] = node_dict.get("marzban_node_status") or "unknown"
                     node_dict["has_ssh_key"] = bool(node_dict.get("ssh_key"))
                     node_dict.pop("ssh_key", None)
                     result.append(node_dict)
                 return result
-    except Exception as e:
-        logger.error(f"Ошибка при получении нод: {e}")
+    except Exception as exc:
+        logger.error("Ошибка при получении нод: %s", exc)
         raise HTTPException(status_code=500, detail="Ошибка базы данных")
 
+
 @router.post("/nodes")
-async def add_node(node: NodeCreate) -> Dict[str, str]:
-    """Добавление новой ноды в инвентарь."""
+async def add_node(node: NodeCreate) -> Dict[str, Any]:
+    """
+    Добавление новой ноды в инвентарь + опциональный bootstrap + привязка к Marzban.
+    """
+    _validate_node_role(node.role)
+    _validate_inbound_tag(node.inbound_tag)
+
     try:
-        # Если ключ не предоставлен, сгенерируем уникальный SSH-ключ для этой ноды
         final_ssh_key = node.ssh_key
         if not final_ssh_key:
-            import asyncssh
-            generated = asyncssh.generate_private_key('ssh-rsa', key_size=2048)
-            final_ssh_key = generated.export_private_key().decode('utf-8')
+            generated = asyncssh.generate_private_key("ssh-rsa", key_size=2048)
+            final_ssh_key = generated.export_private_key().decode("utf-8")
 
         async with get_db_connection() as db:
-            await db.execute(
-                "INSERT INTO nodes (ip, role, billing_date, ssh_key, ssh_port) VALUES (?, ?, ?, ?, ?)",
-                (node.ip, node.role, node.billing_date, final_ssh_key, node.ssh_port),
+            cursor = await db.execute(
+                """
+                INSERT INTO nodes (
+                    name, ip, role, billing_date, status,
+                    ssh_key, ssh_port,
+                    inbound_tag, inbound_port, group_sni, fingerprint,
+                    provision_status
+                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, 'provisioning')
+                """,
+                (
+                    node.name.strip(),
+                    node.ip,
+                    node.role,
+                    node.billing_date,
+                    final_ssh_key,
+                    node.ssh_port,
+                    node.inbound_tag,
+                    int(node.inbound_port),
+                    node.group_sni.strip(),
+                    node.fingerprint.strip(),
+                ),
             )
             await db.commit()
+            node_id = int(cursor.lastrowid)
+
+        provision_result = await deployer.provision_and_attach(
+            node_id=node_id,
+            name=node.name.strip(),
+            ip=node.ip,
+            ssh_port=node.ssh_port,
+            inbound_tag=node.inbound_tag,
+            inbound_port=node.inbound_port,
+            group_sni=node.group_sni.strip(),
+            fingerprint=node.fingerprint.strip(),
+            is_new_server=node.is_new_server,
+        )
+
+        if not provision_result.get("ok"):
+            return {
+                "status": "partial",
+                "message": (
+                    f"Сервер {node.name} добавлен в инвентарь, но автоподключение не завершено: "
+                    f"{provision_result.get('message', 'неизвестная ошибка')}"
+                ),
+                "node_id": node_id,
+                "provision": provision_result,
+            }
+
         return {
             "status": "success",
-            "message": f"Сервер {node.ip}:{node.ssh_port} успешно добавлен в инвентарь.",
+            "message": f"Сервер {node.name} успешно добавлен и подключен к Marzban ({node.inbound_tag}).",
+            "node_id": node_id,
+            "provision": provision_result,
         }
-    except Exception as e:
-        logger.error(f"Ошибка при добавлении ноды {node.ip}: {e}")
-        raise HTTPException(status_code=400, detail="Ошибка при добавлении (возможно IP уже существует)")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Ошибка при добавлении ноды %s: %s", node.ip, exc)
+        raise HTTPException(status_code=400, detail="Ошибка при добавлении (возможно IP уже существует).")
 
 
 @router.put("/nodes/{node_id}")
-async def update_node(node_id: int, node: NodeUpdate) -> Dict[str, str]:
+async def update_node(node_id: int, node: NodeUpdate) -> Dict[str, Any]:
     """
     Редактирование параметров существующей ноды.
-    Позволяет обновлять IP, роль, дату оплаты, SSH-порт, статус и (опционально) SSH-ключ.
+    Поддерживает повторную привязку к Marzban (reconnect_marzban=true).
     """
     payload = node.model_dump(exclude_unset=True)
-    if not payload:
+    reconnect_marzban = bool(payload.pop("reconnect_marzban", False))
+
+    if not payload and not reconnect_marzban:
         raise HTTPException(status_code=400, detail="Нет данных для обновления.")
 
-    allowed_roles = {"master", "ingress", "egress"}
-    allowed_statuses = {"active", "offline"}
+    if "role" in payload:
+        _validate_node_role(str(payload["role"]))
 
-    if "role" in payload and payload["role"] not in allowed_roles:
-        raise HTTPException(status_code=400, detail="Некорректная роль ноды.")
-
-    if "status" in payload and payload["status"] not in allowed_statuses:
+    if "status" in payload and payload["status"] not in ALLOWED_NODE_STATUSES:
         raise HTTPException(status_code=400, detail="Некорректный статус ноды.")
+
+    if "inbound_tag" in payload:
+        _validate_inbound_tag(str(payload["inbound_tag"]))
 
     try:
         async with get_db_connection() as db:
             async with db.execute(
-                "SELECT id, ip, role, billing_date, ssh_key, ssh_port, status FROM nodes WHERE id = ?",
+                """
+                SELECT
+                    id, name, ip, role, billing_date, status,
+                    ssh_key, ssh_port,
+                    inbound_tag, inbound_port, group_sni, fingerprint,
+                    marzban_node_id, marzban_node_status, marzban_last_error,
+                    provision_status
+                FROM nodes WHERE id = ?
+                """,
                 (node_id,),
             ) as cursor:
                 existing = await cursor.fetchone()
@@ -250,42 +367,112 @@ async def update_node(node_id: int, node: NodeUpdate) -> Dict[str, str]:
                 raise HTTPException(status_code=404, detail="Сервер не найден.")
 
             merged = dict(existing)
-
             for key, value in payload.items():
                 if key == "ssh_key":
-                    # Пустой ключ не перезаписывает существующий
                     if value is None:
                         continue
                     if isinstance(value, str) and not value.strip():
                         continue
-                    merged["ssh_key"] = value
-                else:
-                    merged[key] = value
+                merged[key] = value
 
             await db.execute(
                 """
                 UPDATE nodes
-                SET ip = ?, role = ?, billing_date = ?, ssh_key = ?, ssh_port = ?, status = ?
+                SET name = ?, ip = ?, role = ?, billing_date = ?, status = ?,
+                    ssh_key = ?, ssh_port = ?,
+                    inbound_tag = ?, inbound_port = ?, group_sni = ?, fingerprint = ?
                 WHERE id = ?
                 """,
                 (
+                    merged["name"],
                     merged["ip"],
                     merged["role"],
                     merged["billing_date"],
+                    merged["status"],
                     merged["ssh_key"],
                     int(merged["ssh_port"]),
-                    merged["status"],
+                    merged["inbound_tag"],
+                    int(merged["inbound_port"] or 0),
+                    merged["group_sni"],
+                    merged["fingerprint"],
                     node_id,
                 ),
             )
             await db.commit()
 
-        return {"status": "success", "message": f"Параметры сервера {merged['ip']} обновлены."}
+        if reconnect_marzban:
+            provision_result = await deployer.provision_and_attach(
+                node_id=node_id,
+                name=str(merged["name"]),
+                ip=str(merged["ip"]),
+                ssh_port=int(merged["ssh_port"]),
+                inbound_tag=str(merged["inbound_tag"]),
+                inbound_port=int(merged["inbound_port"]),
+                group_sni=str(merged["group_sni"]),
+                fingerprint=str(merged["fingerprint"]),
+                is_new_server=False,
+            )
+
+            if not provision_result.get("ok"):
+                return {
+                    "status": "partial",
+                    "message": (
+                        f"Параметры сервера {merged['name']} обновлены, но переподключение к Marzban завершилось ошибкой: "
+                        f"{provision_result.get('message')}"
+                    ),
+                    "provision": provision_result,
+                }
+
+            return {
+                "status": "success",
+                "message": f"Параметры сервера {merged['name']} обновлены и Marzban переподключен.",
+                "provision": provision_result,
+            }
+
+        return {"status": "success", "message": f"Параметры сервера {merged['name']} обновлены."}
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error("Ошибка при обновлении ноды id=%s: %s", node_id, e)
+    except Exception as exc:
+        logger.error("Ошибка при обновлении ноды id=%s: %s", node_id, exc)
         raise HTTPException(status_code=400, detail="Не удалось обновить сервер (проверьте уникальность IP).")
+
+
+@router.delete("/nodes/{node_id}")
+async def delete_node(node_id: int, payload: NodeDeleteRequest) -> Dict[str, Any]:
+    """
+    Удаление ноды из панели, Marzban и (опционально) cleanup на самой ноде по SSH.
+    """
+    try:
+        async with get_db_connection() as db:
+            async with db.execute(
+                """
+                SELECT id, name, ip, inbound_tag, marzban_node_id
+                FROM nodes
+                WHERE id = ?
+                """,
+                (node_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Сервер не найден.")
+
+        node = dict(row)
+        result = await deployer.delete_from_everywhere(
+            node_id=int(node["id"]),
+            name=str(node.get("name") or node["ip"]),
+            ip=str(node["ip"]),
+            inbound_tag=node.get("inbound_tag"),
+            marzban_node_id=node.get("marzban_node_id"),
+            cleanup_on_node=payload.cleanup_remote,
+        )
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Ошибка удаления ноды id=%s: %s", node_id, exc)
+        raise HTTPException(status_code=400, detail="Не удалось удалить сервер.")
 
 
 @router.get("/status/overview")
@@ -297,7 +484,13 @@ async def get_status_overview() -> Dict[str, Any]:
     """
     async with get_db_connection() as db:
         async with db.execute(
-            "SELECT id, ip, role, status, ssh_port FROM nodes ORDER BY id ASC"
+            """
+            SELECT
+                id, name, ip, role, status, ssh_port,
+                inbound_tag, provision_status, marzban_node_status, marzban_last_error
+            FROM nodes
+            ORDER BY id ASC
+            """
         ) as cursor:
             nodes_rows = await cursor.fetchall()
 
@@ -317,10 +510,15 @@ async def get_status_overview() -> Dict[str, Any]:
         if node_status != "active":
             return {
                 "id": node.get("id"),
+                "name": node.get("name"),
                 "ip": node_ip,
                 "role": node.get("role"),
                 "status": node_status,
                 "ssh_port": node_port,
+                "inbound_tag": node.get("inbound_tag"),
+                "provision_status": node.get("provision_status"),
+                "marzban_node_status": node.get("marzban_node_status"),
+                "marzban_last_error": node.get("marzban_last_error"),
                 "checked": False,
                 "connected": False,
                 "error": "Сервер помечен как неактивный.",
@@ -335,10 +533,15 @@ async def get_status_overview() -> Dict[str, Any]:
 
         return {
             "id": node.get("id"),
+            "name": node.get("name"),
             "ip": node_ip,
             "role": node.get("role"),
             "status": node_status,
             "ssh_port": node_port,
+            "inbound_tag": node.get("inbound_tag"),
+            "provision_status": node.get("provision_status"),
+            "marzban_node_status": node.get("marzban_node_status"),
+            "marzban_last_error": node.get("marzban_last_error"),
             "checked": True,
             "connected": bool(success and "LUFFY_OK" in output),
             "error": None if success else output,
@@ -358,8 +561,39 @@ async def get_status_overview() -> Dict[str, Any]:
         "marzban_connected": bool(marzban_status.get("connected")),
         "marzban_users_count": int(marzban_status.get("users_count", 0)),
         "marzban_error": marzban_status.get("error"),
+        "marzban_error_code": marzban_status.get("error_code"),
+        "marzban_http_status": marzban_status.get("http_status"),
         "nodes": checked_nodes,
     }
+
+
+@router.get("/marzban/connection")
+async def get_marzban_connection() -> Dict[str, Any]:
+    """
+    Явная проверка коннекта к Marzban для UI.
+    """
+    return await marzban_manager.get_connection_status(force_reauth=True)
+
+
+@router.post("/marzban/reconnect")
+async def reconnect_marzban() -> Dict[str, Any]:
+    """
+    Принудительное переподключение к Marzban (сброс токена).
+    """
+    result = await marzban_manager.force_reconnect()
+    if result.get("connected"):
+        return {
+            "status": "success",
+            "message": "Подключение к Marzban восстановлено.",
+            "connection": result,
+        }
+
+    return {
+        "status": "error",
+        "message": result.get("error") or "Не удалось восстановить подключение к Marzban.",
+        "connection": result,
+    }
+
 
 @router.post("/haproxy/apply")
 async def apply_haproxy_config(data: HAProxyUpdate) -> Dict[str, str]:
@@ -367,7 +601,7 @@ async def apply_haproxy_config(data: HAProxyUpdate) -> Dict[str, str]:
     Применение нового конфига HAProxy на указанной ноде.
     Использует HAProxyManager для безопасного деплоя с откатом.
     """
-    logger.info(f"Запрос на обновление HAProxy для {data.ip}")
+    logger.info("Запрос на обновление HAProxy для %s", data.ip)
 
     config_content = (data.config_content or data.config or "").strip()
     if not config_content:
@@ -377,12 +611,11 @@ async def apply_haproxy_config(data: HAProxyUpdate) -> Dict[str, str]:
         )
 
     success, message = await haproxy_manager.apply_config(data.ip, config_content)
-    
+
     if success:
         return {"status": "success", "message": message}
-    else:
-        # Возвращаем 400 с текстом ошибки (например, синтаксической), чтобы показать в UI
-        raise HTTPException(status_code=400, detail=message)
+
+    raise HTTPException(status_code=400, detail=message)
 
 
 @router.post("/sysinfo")
@@ -409,7 +642,7 @@ async def get_marzban_stats() -> Dict[str, Any]:
     """
     Возвращает агрегированную статистику для вкладки Marzban:
     - top_users
-    - anomalies (эвристические предупреждения)
+    - anomalies
     """
     users = await marzban_manager.get_users()
     if not users:
@@ -424,14 +657,14 @@ async def get_marzban_stats() -> Dict[str, Any]:
     for idx, user in enumerate(sorted_users[:10], start=1):
         username = str(user.get("username", "unknown"))
         used_traffic = int(user.get("used_traffic", 0) or 0)
-        status = str(user.get("status", "unknown"))
-        used_gb = round(used_traffic / (1024 ** 3), 2)
+        status_value = str(user.get("status", "unknown"))
+        used_gb = round(used_traffic / (1024**3), 2)
 
         top_users.append(
             {
                 "username": username,
                 "traffic": f"{used_gb} GB",
-                "status": status,
+                "status": status_value,
                 "used_bytes": used_traffic,
             }
         )

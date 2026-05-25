@@ -1,187 +1,304 @@
-import os
 import logging
 import asyncssh
-from typing import Tuple
+from typing import Tuple, Dict, Any, Optional, List
 
 from config import config
 from db.database import get_db_connection
 from services.ssh_manager import ssh_manager
+from services.marzban import marzban_manager
 
 logger = logging.getLogger(__name__)
 
+
 class NodeDeployer:
     """
-    Модуль для автоматического развертывания Ingress и Egress нод.
+    Сервис оркестрации нод:
+    - legacy deploy по паролю (для совместимости)
+    - bootstrap новой ноды (утилиты, docker, marzban-node)
+    - регистрация ноды в Marzban и привязка к inbound group
+    - cleanup при удалении
     """
-    def __init__(self):
+
+    def __init__(self) -> None:
         self.pub_key_path = f"{config.SSH_KEY_PATH}.pub"
 
     async def _inject_ssh_key(self, ip: str, password: str, public_key_str: str) -> Tuple[bool, str]:
-        """
-        Подключается к серверу по паролю и добавляет публичный ключ в authorized_keys.
-        """
         setup_script = f"""
+        set -e
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
-        echo "{public_key_str}" >> ~/.ssh/authorized_keys
+        grep -qxF '{public_key_str}' ~/.ssh/authorized_keys || echo '{public_key_str}' >> ~/.ssh/authorized_keys
         chmod 600 ~/.ssh/authorized_keys
-        # Отключаем вход по паролю для безопасности (опционально, закомментировано для тестов)
-        # sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-        # systemctl restart sshd
         """
 
         try:
-            # Подключаемся строго по паролю для первичной настройки
             async with asyncssh.connect(
-                ip, 
+                ip,
                 port=config.SSH_PORT,
-                username=config.SSH_DEFAULT_USER, 
-                password=password, 
-                known_hosts=None
+                username=config.SSH_DEFAULT_USER,
+                password=password,
+                known_hosts=None,
             ) as conn:
                 result = await conn.run(setup_script, check=False)
                 if result.exit_status == 0:
                     return True, "SSH ключ успешно установлен."
                 return False, f"Ошибка установки ключа: {result.stderr}"
-        except Exception as e:
-            logger.error(f"Ошибка инъекции ключа на {ip}: {e}")
-            return False, str(e)
+        except Exception as exc:
+            logger.error("Ошибка инъекции ключа на %s: %s", ip, exc)
+            return False, str(exc)
 
     async def deploy_node(self, ip: str, role: str, password: str, billing_date: str) -> Tuple[bool, str]:
         """
-        Главный метод деплоя.
-        1. Генерирует уникальный SSH-ключ для этой конкретной ноды.
-        2. Прокидывает публичный ключ на ноду по паролю.
-        3. Записывает ноду во временное состояние в БД с её приватным ключом.
-        4. Запускает bash-скрипт настройки по SSH с использованием свежесозданного ключа.
-        5. Финализирует в БД.
+        Legacy-команда /deploy из бота.
+        Оставлена для обратной совместимости.
         """
-        logger.info(f"Начинаем деплой ноды {ip} с ролью {role}...")
+        logger.info("Legacy deploy запрошен для %s (%s)", ip, role)
 
-        # Шаг 1: Генерация индивидуального ключа
         try:
-            generated_key = asyncssh.generate_private_key('ssh-rsa', key_size=2048)
-            private_key_str = generated_key.export_private_key().decode('utf-8')
-            public_key_str = generated_key.export_public_key().decode('utf-8').strip()
-        except Exception as e:
-            logger.error(f"Не удалось сгенерировать SSH-ключ для ноды {ip}: {e}")
-            return False, f"Ошибка генерации SSH-ключа: {e}"
+            generated_key = asyncssh.generate_private_key("ssh-rsa", key_size=2048)
+            private_key_str = generated_key.export_private_key().decode("utf-8")
+            public_key_str = generated_key.export_public_key().decode("utf-8").strip()
+        except Exception as exc:
+            return False, f"Ошибка генерации SSH-ключа: {exc}"
 
-        # Шаг 2: Установка SSH ключа
         key_success, key_msg = await self._inject_ssh_key(ip, password, public_key_str)
         if not key_success:
             return False, f"Сбой на этапе авторизации: {key_msg}"
 
-        # Шаг 3: Временное добавление в БД, чтобы ssh_manager мог использовать этот ключ во время деплоя
         try:
             async with get_db_connection() as db:
-                # Сначала удалим старую запись, если она была (для чистоты)
                 await db.execute("DELETE FROM nodes WHERE ip = ?", (ip,))
                 await db.execute(
-                    "INSERT INTO nodes (ip, role, billing_date, status, ssh_key) VALUES (?, ?, ?, 'active', ?)",
-                    (ip, role, billing_date, private_key_str)
+                    """
+                    INSERT INTO nodes (
+                        name, ip, role, billing_date, status, ssh_key, ssh_port, provision_status
+                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, 'pending')
+                    """,
+                    (ip, ip, role, billing_date, private_key_str, config.SSH_PORT),
                 )
                 await db.commit()
-        except Exception as e:
-            logger.error(f"Ошибка предварительного сохранения ключа ноды {ip} в БД: {e}")
+        except Exception as exc:
+            logger.error("Ошибка предварительного сохранения ноды %s: %s", ip, exc)
             return False, "Не удалось сохранить SSH-ключ в базу данных."
 
-        # Шаг 4: Выбор и запуск скрипта настройки
-        if role == "ingress":
-            script = self._get_ingress_script()
-        elif role == "egress":
-            script = self._get_egress_script()
-        else:
-            # Откатываем временную запись в случае ошибки
-            async with get_db_connection() as db:
-                await db.execute("DELETE FROM nodes WHERE ip = ?", (ip,))
-                await db.commit()
-            return False, f"Неизвестная роль: {role}"
+        # Для legacy делаем только базовый bootstrap
+        install_result = await self.bootstrap_new_server(ip)
+        if not install_result["ok"]:
+            return False, install_result["message"]
 
-        logger.info(f"Запуск конфигурационного скрипта на {ip}...")
-        # Теперь ssh_manager автоматически подхватит сохраненный private_key_str из БД!
-        deploy_success, deploy_result = await ssh_manager.execute_command(ip, script, timeout=300)
+        return True, f"Нода {ip} ({role}) успешно подготовлена и добавлена в кластер."
 
-        if not deploy_success:
-            # Удаляем запись о ноде из БД, так как деплой провалился
-            async with get_db_connection() as db:
-                await db.execute("DELETE FROM nodes WHERE ip = ?", (ip,))
-                await db.commit()
-            return False, f"Ошибка при выполнении скрипта деплоя:\n{deploy_result}"
-
-        return True, f"Нода {ip} ({role}) успешно развернута, защищена уникальным ключом и добавлена в кластер!"
-
-    def _get_ingress_script(self) -> str:
-        """Bash-скрипт для настройки Ingress-ноды (Москва)."""
-        return """
-        #!/bin/bash
-        set -e # Остановка при любой ошибке
-        
-        echo "=== Обновление системы ==="
-        DEBIAN_FRONTEND=noninteractive apt-get update -y
-        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ufw haproxy nginx unzip
-        
-        echo "=== Настройка UFW ==="
-        ufw --force reset
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw allow 22/tcp
-        ufw allow 443/tcp   # Входящий клиентский трафик
-        ufw allow 2096/tcp  # Трафик подписок
-        ufw --force enable
-        
-        echo "=== Настройка Nginx (Decoy) ==="
-        cat << 'EOF' > /etc/nginx/sites-available/default
-server {
-    listen 8449;
-    server_name _;
-    location / {
-        return 200 "Storage Gateway OK\n";
-    }
-}
-EOF
-        systemctl restart nginx
-        systemctl enable nginx
-        
-        echo "=== Установка Xray Core ==="
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-        systemctl enable xray
-        
-        echo "=== Деплой Ingress завершен ==="
+    async def bootstrap_new_server(self, ip: str) -> Dict[str, Any]:
         """
-
-    def _get_egress_script(self) -> str:
-        """Bash-скрипт для настройки Egress-ноды (Европа)."""
-        return """
-        #!/bin/bash
-        set -e
-        
-        echo "=== Обновление системы ==="
-        DEBIAN_FRONTEND=noninteractive apt-get update -y
-        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ufw unzip
-        
-        echo "=== Настройка UFW ==="
-        ufw --force reset
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw allow 22/tcp
-        # Разрешаем входящий трафик только от Ingress нод (в реале нужно подставлять IP)
-        ufw allow 443/tcp 
-        ufw --force enable
-        
-        echo "=== Оптимизация ядра (BBR) ==="
-        cat << 'EOF' > /etc/sysctl.d/99-bbr.conf
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.ip_forward=1
-EOF
-        sysctl --system
-        
-        echo "=== Установка Xray Core ==="
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-        systemctl enable xray
-        
-        echo "=== Деплой Egress завершен ==="
+        Устанавливает базовый набор ПО на новую ноду:
+        ufw, fail2ban, docker, marzban-node + инструменты мониторинга.
         """
+        bootstrap_script = r"""
+set -e
+export DEBIAN_FRONTEND=noninteractive
 
+apt-get update -y
+apt-get install -y \
+  ca-certificates \
+  curl \
+  gnupg \
+  lsb-release \
+  software-properties-common \
+  jq \
+  unzip \
+  ufw \
+  fail2ban \
+  htop \
+  net-tools \
+  iotop \
+  vnstat
+
+# Docker (если не установлен)
+if ! command -v docker >/dev/null 2>&1; then
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+    $(. /etc/os-release && echo $VERSION_CODENAME) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+fi
+
+systemctl enable docker || true
+systemctl start docker || true
+
+systemctl enable fail2ban || true
+systemctl restart fail2ban || true
+
+ufw --force enable || true
+ufw allow 22/tcp || true
+
+# marzban-node installer (идемпотентно, если уже есть - пропускаем)
+if [ ! -f /opt/marzban-node/docker-compose.yml ]; then
+  bash -c "$(curl -fsSL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh)" @ install || true
+fi
+
+echo "LUFFY_BOOTSTRAP_OK"
+"""
+
+        success, output = await ssh_manager.execute_command(ip, bootstrap_script, timeout=1200)
+        if not success:
+            return {
+                "ok": False,
+                "message": f"Bootstrap ноды {ip} не завершен: {output}",
+                "output": output,
+            }
+
+        return {
+            "ok": True,
+            "message": f"Нода {ip} подготовлена: утилиты и marzban-node установлены.",
+            "output": output,
+        }
+
+    async def provision_and_attach(
+        self,
+        *,
+        node_id: int,
+        name: str,
+        ip: str,
+        ssh_port: int,
+        inbound_tag: str,
+        inbound_port: int,
+        group_sni: str,
+        fingerprint: str,
+        is_new_server: bool,
+    ) -> Dict[str, Any]:
+        """
+        Полный pipeline для ноды:
+        1) bootstrap новой ноды (опционально)
+        2) add node в Marzban
+        3) attach host в inbound group
+        """
+        steps: List[Dict[str, Any]] = []
+
+        if is_new_server:
+            bootstrap = await self.bootstrap_new_server(ip)
+            steps.append({"step": "bootstrap", **bootstrap})
+            if not bootstrap["ok"]:
+                await self._set_node_provision_state(node_id, "error", "Ошибка bootstrap новой ноды")
+                return {"ok": False, "steps": steps, "message": bootstrap["message"]}
+
+        marzban_add = await marzban_manager.add_node(name=name, address=ip, port=ssh_port)
+        steps.append({"step": "marzban_add_node", **marzban_add})
+        if not marzban_add.get("ok"):
+            await self._set_node_provision_state(node_id, "error", marzban_add.get("error"))
+            return {"ok": False, "steps": steps, "message": marzban_add.get("error")}
+
+        marzban_node_id = marzban_add.get("node_id")
+
+        attach_result = await marzban_manager.ensure_host_in_group(
+            inbound_tag=inbound_tag,
+            remark=name,
+            address=ip,
+            port=inbound_port,
+            sni=group_sni,
+            fingerprint=fingerprint,
+        )
+        steps.append({"step": "marzban_attach_inbound", **attach_result})
+
+        if not attach_result.get("ok"):
+            await self._set_node_provision_state(node_id, "error", attach_result.get("error"))
+            return {"ok": False, "steps": steps, "message": attach_result.get("error")}
+
+        async with get_db_connection() as db:
+            await db.execute(
+                """
+                UPDATE nodes
+                SET marzban_node_id = ?,
+                    marzban_node_status = ?,
+                    marzban_last_error = NULL,
+                    provision_status = ?
+                WHERE id = ?
+                """,
+                (marzban_node_id, "connected", "ready", node_id),
+            )
+            await db.commit()
+
+        return {
+            "ok": True,
+            "steps": steps,
+            "message": f"Сервер {name} подключен: Marzban + inbound {inbound_tag} настроены.",
+            "marzban_node_id": marzban_node_id,
+        }
+
+    async def delete_from_everywhere(
+        self,
+        *,
+        node_id: int,
+        name: str,
+        ip: str,
+        inbound_tag: Optional[str],
+        marzban_node_id: Optional[int],
+        cleanup_on_node: bool,
+    ) -> Dict[str, Any]:
+        """
+        Удаление ноды:
+        - из Marzban hosts/inbound
+        - из Marzban node registry
+        - (опционально) cleanup на удаленной ноде по SSH
+        """
+        steps: List[Dict[str, Any]] = []
+
+        if inbound_tag:
+            host_remove = await marzban_manager.remove_host_from_group(
+                inbound_tag=inbound_tag,
+                address=ip,
+                remark=name,
+            )
+            steps.append({"step": "marzban_remove_host", **host_remove})
+
+        if marzban_node_id:
+            node_remove = await marzban_manager.remove_node(int(marzban_node_id))
+            steps.append({"step": "marzban_remove_node", **node_remove})
+
+        if cleanup_on_node:
+            cleanup_script = r"""
+set +e
+systemctl stop marzban-node 2>/dev/null || true
+cd /opt/marzban-node 2>/dev/null && docker compose down 2>/dev/null || true
+rm -rf /opt/marzban-node 2>/dev/null || true
+ufw delete allow 22/tcp 2>/dev/null || true
+echo "LUFFY_REMOTE_CLEANUP_OK"
+"""
+            success, output = await ssh_manager.execute_command(ip, cleanup_script, timeout=300)
+            steps.append(
+                {
+                    "step": "remote_cleanup",
+                    "ok": success,
+                    "message": output if success else f"Ошибка cleanup на ноде: {output}",
+                }
+            )
+
+        async with get_db_connection() as db:
+            await db.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+            await db.commit()
+
+        return {
+            "ok": True,
+            "message": f"Сервер {name} удален из панели и Marzban.",
+            "steps": steps,
+        }
+
+    async def _set_node_provision_state(self, node_id: int, state: str, error_text: Optional[str]) -> None:
+        async with get_db_connection() as db:
+            await db.execute(
+                """
+                UPDATE nodes
+                SET provision_status = ?,
+                    marzban_last_error = ?,
+                    marzban_node_status = CASE WHEN ? = 'error' THEN 'error' ELSE marzban_node_status END
+                WHERE id = ?
+                """,
+                (state, error_text, state, node_id),
+            )
+            await db.commit()
+
+
+# Глобальный экземпляр
 deployer = NodeDeployer()
