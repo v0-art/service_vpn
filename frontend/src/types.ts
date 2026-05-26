@@ -39,7 +39,7 @@ export interface NodeCreatePayload {
   inbound_port: number;
   group_sni: string;
   fingerprint: string;
-  is_new_server: boolean;
+  add_mode: 'existing' | 'new';
 }
 
 export interface NodeUpdatePayload {

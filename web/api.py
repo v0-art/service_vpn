@@ -167,7 +167,9 @@ class NodeCreate(BaseModel):
     inbound_port: int = Field(ge=1, le=65535)
     group_sni: str = Field(min_length=2, max_length=255)
     fingerprint: str = Field(min_length=2, max_length=32)
-    is_new_server: bool = False
+    add_mode: str = "existing"
+    # Backward-compatibility with old frontend payload.
+    is_new_server: Optional[bool] = None
 
 
 class NodeUpdate(BaseModel):
@@ -259,6 +261,13 @@ async def add_node(node: NodeCreate) -> Dict[str, Any]:
     _validate_inbound_tag(node.inbound_tag)
 
     try:
+        mode_raw = (node.add_mode or "").strip().lower()
+        if mode_raw not in {"existing", "new"}:
+            if node.is_new_server is True:
+                mode_raw = "new"
+            else:
+                mode_raw = "existing"
+
         final_ssh_key = node.ssh_key
         if not final_ssh_key:
             generated = asyncssh.generate_private_key("ssh-rsa", key_size=2048)
@@ -272,7 +281,7 @@ async def add_node(node: NodeCreate) -> Dict[str, Any]:
                     ssh_key, ssh_port,
                     inbound_tag, inbound_port, group_sni, fingerprint,
                     provision_status
-                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, 'provisioning')
+                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     node.name.strip(),
@@ -285,10 +294,32 @@ async def add_node(node: NodeCreate) -> Dict[str, Any]:
                     int(node.inbound_port),
                     node.group_sni.strip(),
                     node.fingerprint.strip(),
+                    "provisioning" if mode_raw == "new" else "ready",
                 ),
             )
             await db.commit()
             node_id = int(cursor.lastrowid)
+
+        if mode_raw == "existing":
+            async with get_db_connection() as db:
+                await db.execute(
+                    """
+                    UPDATE nodes
+                    SET marzban_node_status = ?, marzban_last_error = NULL
+                    WHERE id = ?
+                    """,
+                    ("unmanaged", node_id),
+                )
+                await db.commit()
+            return {
+                "status": "success",
+                "message": (
+                    f"Сервер {node.name} добавлен в панель в безопасном режиме "
+                    "(без изменений на сервере и в Marzban)."
+                ),
+                "node_id": node_id,
+                "mode": "existing",
+            }
 
         provision_result = await deployer.provision_and_attach(
             node_id=node_id,
@@ -299,7 +330,7 @@ async def add_node(node: NodeCreate) -> Dict[str, Any]:
             inbound_port=node.inbound_port,
             group_sni=node.group_sni.strip(),
             fingerprint=node.fingerprint.strip(),
-            is_new_server=node.is_new_server,
+            is_new_server=True,
         )
 
         if not provision_result.get("ok"):
@@ -311,6 +342,7 @@ async def add_node(node: NodeCreate) -> Dict[str, Any]:
                 ),
                 "node_id": node_id,
                 "provision": provision_result,
+                "mode": "new",
             }
 
         return {
@@ -318,6 +350,7 @@ async def add_node(node: NodeCreate) -> Dict[str, Any]:
             "message": f"Сервер {node.name} успешно добавлен и подключен к Marzban ({node.inbound_tag}).",
             "node_id": node_id,
             "provision": provision_result,
+            "mode": "new",
         }
     except HTTPException:
         raise

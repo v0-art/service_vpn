@@ -641,6 +641,7 @@ function DeployForm({
   onError: (message: string) => void;
 }) {
   const [loading, setLoading] = useState(false);
+  const [addMode, setAddMode] = useState<'existing' | 'new'>('existing');
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -658,7 +659,7 @@ function DeployForm({
       inbound_port: Number(formData.get('inbound_port') || 443),
       group_sni: String(formData.get('group_sni') || '').trim(),
       fingerprint: String(formData.get('fingerprint') || '').trim(),
-      is_new_server: formData.get('is_new_server') === 'on',
+      add_mode: addMode,
     };
 
     const res = await addNode(payload);
@@ -684,6 +685,50 @@ function DeployForm({
         <span className="text-sm font-semibold uppercase tracking-[0.05em] text-app-muted">Добавление и подключение сервера</span>
       </div>
       <form onSubmit={handleSubmit} className="p-4 md:p-6 space-y-5">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={() => setAddMode('existing')}
+            className={`text-left p-3 rounded-md border transition-colors ${
+              addMode === 'existing'
+                ? 'border-app-success bg-app-success/10'
+                : 'border-app-border bg-app-bg/40'
+            }`}
+          >
+            <div className="text-sm font-semibold text-app-text">Существующий сервер</div>
+            <div className="text-xs mt-1 text-app-muted">
+              Безопасный режим: только добавление в панель, без изменений в Marzban и на сервере.
+            </div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setAddMode('new')}
+            className={`text-left p-3 rounded-md border transition-colors ${
+              addMode === 'new'
+                ? 'border-app-warning bg-app-warning/10'
+                : 'border-app-border bg-app-bg/40'
+            }`}
+          >
+            <div className="text-sm font-semibold text-app-text">Новый сервер</div>
+            <div className="text-xs mt-1 text-app-muted">
+              Полный автодеплой: установка утилит + регистрация в Marzban + привязка к группе.
+            </div>
+          </button>
+        </div>
+
+        <div
+          className={`text-xs border rounded-md px-3 py-2 font-mono ${
+            addMode === 'existing'
+              ? 'border-app-success/30 text-app-success bg-app-success/10'
+              : 'border-app-warning/30 text-app-warning bg-app-warning/10'
+          }`}
+        >
+          {addMode === 'existing'
+            ? 'Режим SAFE: сеть не меняем, только карточка сервера в LUFFY TOWER.'
+            : 'Режим DEPLOY: будут изменения в инфраструктуре. Используй только для новых нод.'}
+        </div>
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
             <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Имя сервера</label>
@@ -747,11 +792,6 @@ function DeployForm({
           </div>
         </div>
 
-        <label className="flex items-center gap-2 text-sm text-app-text">
-          <input type="checkbox" name="is_new_server" className="accent-app-accent" />
-          Сервер новый (установить ufw/fail2ban/docker/marzban-node и мониторинг автоматически)
-        </label>
-
         <div>
           <label className="flex text-[11px] items-center justify-between font-semibold text-app-muted mb-2 uppercase tracking-wide">
             <span>Приватный SSH ключ</span>
@@ -766,7 +806,13 @@ function DeployForm({
           className="w-full bg-app-accent text-black font-semibold py-2.5 rounded-md text-[13px] hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
         >
           {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-          {loading ? 'Добавление и настройка...' : 'Добавить сервер'}
+          {loading
+            ? addMode === 'new'
+              ? 'Деплой и подключение...'
+              : 'Добавление в панель...'
+            : addMode === 'new'
+            ? 'Добавить и задеплоить сервер'
+            : 'Добавить существующий сервер'}
         </button>
       </form>
     </div>
