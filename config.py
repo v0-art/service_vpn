@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     MARZBAN_URL: str = "http://127.0.0.1:8000"
     MARZBAN_USERNAME: str = "admin"
     MARZBAN_PASSWORD: str = "admin"
+    MARZBAN_INSECURE_TLS: bool = True
 
     def model_post_init(self, __context: object) -> None:
         # Для Marzban берем raw-значения из .env, чтобы спецсимволы не терялись.

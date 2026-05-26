@@ -106,6 +106,10 @@
 - Control Tower запущен в Docker и пытается идти в `127.0.0.1` внутри контейнера (это не хост).
 - Для Marzban на хосте используйте `MARZBAN_URL=http://host.docker.internal:8000`.
 
+Если на `:8000` у Marzban включен TLS (HTTPS), а не HTTP:
+- задайте `MARZBAN_URL=https://<адрес>:8000`;
+- для self-signed сертификата добавьте `MARZBAN_INSECURE_TLS=true`.
+
 ### Сервер недоступен по SSH
 Проверьте:
 - правильный SSH порт;

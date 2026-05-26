@@ -23,6 +23,7 @@ class MarzbanManager:
         self.base_url = config.MARZBAN_URL.rstrip("/")
         self.username = config.MARZBAN_USERNAME
         self.password = config.MARZBAN_PASSWORD
+        self.insecure_tls = bool(config.MARZBAN_INSECURE_TLS)
         self.token: Optional[str] = None
         self.last_auth_status: Optional[int] = None
         self.last_auth_error: Optional[str] = None
@@ -31,16 +32,33 @@ class MarzbanManager:
         self._traffic_state: Dict[str, int] = {}
         self.ANOMALY_THRESHOLD_BYTES = 50 * 1024 * 1024 * 1024
 
+    def _ssl_option(self) -> bool:
+        """
+        Для self-signed Marzban TLS можно отключить проверку сертификата.
+        """
+        if self.base_url.startswith("https://") and self.insecure_tls:
+            return False
+        return True
+
     async def _authenticate(self, force: bool = False) -> bool:
         if self.token and not force:
             return True
 
         url = f"{self.base_url}/api/admin/token"
-        data = {"username": self.username, "password": self.password}
+        data = {
+            "grant_type": "password",
+            "username": self.username,
+            "password": self.password,
+        }
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, data=data, timeout=ClientTimeout(total=10)) as response:
+                async with session.post(
+                    url,
+                    data=data,
+                    timeout=ClientTimeout(total=10),
+                    ssl=self._ssl_option(),
+                ) as response:
                     if response.status == 200:
                         result = await response.json()
                         self.token = result.get("access_token")
@@ -95,6 +113,7 @@ class MarzbanManager:
                     json=json_payload,
                     data=data_payload,
                     timeout=ClientTimeout(total=timeout),
+                    ssl=self._ssl_option(),
                 ) as response:
                     status_code = response.status
 
