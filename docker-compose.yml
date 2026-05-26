@@ -20,3 +20,6 @@ services:
       - DB_PATH=/app/data/luffy_cluster.db
       # Внутри докер-контейнера сервер ОБЯЗАТЕЛЬНО должен слушать 0.0.0.0 для приема запросов извне
       - WEB_HOST=0.0.0.0
+    # Дает контейнеру доступ к сервисам на хосте через host.docker.internal (Linux/Mac/Windows)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
