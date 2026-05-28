@@ -1,11 +1,13 @@
 import os
 import aiosqlite
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "luffy_cluster.db")
 DEFAULT_SSH_PORT = int(os.getenv("SSH_PORT", "2222"))
+DEFAULT_SSH_USER = os.getenv("SSH_DEFAULT_USER", "root")
 
 from contextlib import asynccontextmanager
 
@@ -17,6 +19,7 @@ async def get_db_connection():
     """
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA foreign_keys=ON;")
     # Включаем Write-Ahead Logging
     await conn.execute("PRAGMA journal_mode=WAL;")
     # Оптимизация синхронизации для WAL
@@ -64,6 +67,41 @@ async def init_db() -> None:
                     value TEXT NOT NULL
                 )
             ''')
+
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS node_roles (
+                    node_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (node_id, role),
+                    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+                )
+            ''')
+
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS node_inbounds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id INTEGER NOT NULL,
+                    inbound_tag TEXT NOT NULL,
+                    remark TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    port INTEGER,
+                    sni TEXT,
+                    host TEXT,
+                    fingerprint TEXT,
+                    security TEXT,
+                    alpn TEXT,
+                    is_disabled INTEGER NOT NULL DEFAULT 0,
+                    original_remark TEXT,
+                    raw_json TEXT,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(node_id, inbound_tag, remark, address),
+                    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+                )
+            ''')
+
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_node_inbounds_node_id ON node_inbounds(node_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_node_inbounds_address ON node_inbounds(address)")
             
             async def ensure_column(column_sql: str, column_name: str) -> None:
                 try:
@@ -85,6 +123,15 @@ async def init_db() -> None:
             await ensure_column("marzban_node_status TEXT DEFAULT 'unknown'", "marzban_node_status")
             await ensure_column("marzban_last_error TEXT", "marzban_last_error")
             await ensure_column("provision_status TEXT DEFAULT 'pending'", "provision_status")
+            await ensure_column("ssh_username TEXT", "ssh_username")
+            await ensure_column("ssh_password TEXT", "ssh_password")
+            await ensure_column("credential_status TEXT DEFAULT 'missing'", "credential_status")
+            await ensure_column("marzban_node_name TEXT", "marzban_node_name")
+            await ensure_column("marzban_node_port INTEGER", "marzban_node_port")
+            await ensure_column("marzban_node_api_port INTEGER", "marzban_node_api_port")
+            await ensure_column("marzban_usage_coefficient REAL", "marzban_usage_coefficient")
+            await ensure_column("marzban_node_raw TEXT", "marzban_node_raw")
+            await ensure_column("last_marzban_sync INTEGER", "last_marzban_sync")
 
             # Нормализуем ssh_port для уже существующих записей
             try:
@@ -118,9 +165,70 @@ async def init_db() -> None:
                 await db.execute(
                     "UPDATE nodes SET marzban_node_status = 'unknown' WHERE marzban_node_status IS NULL OR marzban_node_status = ''"
                 )
+                await db.execute(
+                    "UPDATE nodes SET ssh_username = ? WHERE ssh_username IS NULL OR ssh_username = ''",
+                    (DEFAULT_SSH_USER,),
+                )
+                await db.execute(
+                    """
+                    UPDATE nodes
+                    SET credential_status = CASE
+                        WHEN ssh_key IS NOT NULL AND ssh_key != '' THEN 'configured'
+                        WHEN ssh_password IS NOT NULL AND ssh_password != '' THEN 'configured'
+                        ELSE 'missing'
+                    END
+                    WHERE credential_status IS NULL OR credential_status = ''
+                    """
+                )
                 await db.commit()
             except aiosqlite.OperationalError:
                 pass
+
+            now = int(time.time())
+            try:
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO node_roles (node_id, role, created_at)
+                    SELECT
+                        id,
+                        CASE
+                            WHEN role = 'master' THEN 'master'
+                            WHEN role = 'egress' THEN 'direct_eu'
+                            ELSE 'direct_ru'
+                        END,
+                        ?
+                    FROM nodes
+                    WHERE role IS NOT NULL AND role != ''
+                    """,
+                    (now,),
+                )
+                await db.commit()
+            except aiosqlite.OperationalError:
+                pass
+
+            try:
+                from services.secrets import secret_manager
+
+                if secret_manager.can_encrypt():
+                    async with db.execute("SELECT id, ssh_key, ssh_password FROM nodes") as cursor:
+                        rows = await cursor.fetchall()
+
+                    for row in rows:
+                        updates = {}
+                        if row["ssh_key"] and not secret_manager.is_encrypted(row["ssh_key"]):
+                            updates["ssh_key"] = secret_manager.encrypt(row["ssh_key"])
+                        if row["ssh_password"] and not secret_manager.is_encrypted(row["ssh_password"]):
+                            updates["ssh_password"] = secret_manager.encrypt(row["ssh_password"])
+
+                        if updates:
+                            assignments = ", ".join(f"{field} = ?" for field in updates)
+                            values = list(updates.values())
+                            values.append(row["id"])
+                            await db.execute(f"UPDATE nodes SET {assignments} WHERE id = ?", values)
+
+                    await db.commit()
+            except Exception as exc:
+                logger.error("Не удалось зашифровать существующие SSH credentials: %s", exc)
             
             await db.commit()
             logger.info("База данных успешно инициализирована (WAL-режим активен).")

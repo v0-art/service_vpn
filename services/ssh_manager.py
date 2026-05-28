@@ -2,6 +2,7 @@ import logging
 import asyncssh
 from typing import Tuple, Optional, Any
 from config import config
+from services.secrets import secret_manager
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +37,23 @@ class SSHManager:
         
         # Получаем индивидуальные SSH-параметры для этого хоста из БД, если они есть
         ssh_key_content: Optional[str] = None
+        ssh_password: Optional[str] = None
         target_port: int = self.port
         try:
             from db.database import get_db_connection
             async with get_db_connection() as db:
-                async with db.execute("SELECT ssh_key, ssh_port FROM nodes WHERE ip = ?", (host,)) as cursor:
+                async with db.execute(
+                    "SELECT ssh_key, ssh_password, ssh_username, ssh_port FROM nodes WHERE ip = ?",
+                    (host,),
+                ) as cursor:
                     row = await cursor.fetchone()
                     if row:
                         if row["ssh_key"]:
-                            ssh_key_content = row["ssh_key"]
+                            ssh_key_content = secret_manager.decrypt(row["ssh_key"])
+                        if row["ssh_password"]:
+                            ssh_password = secret_manager.decrypt(row["ssh_password"])
+                        if not user and row["ssh_username"]:
+                            target_user = str(row["ssh_username"])
                         if row["ssh_port"]:
                             target_port = int(row["ssh_port"])
         except Exception as e:
@@ -60,7 +69,8 @@ class SSHManager:
                 logger.error(f"Ошибка парсинга индивидуального SSH-ключа для {host}: {e}")
                 client_keys.append(self.key_path)
         else:
-            client_keys.append(self.key_path)
+            if not ssh_password:
+                client_keys.append(self.key_path)
         
         try:
             # known_hosts=None позволяет подключаться к новым нодам без ручного подтверждения fingerprint.
@@ -70,6 +80,7 @@ class SSHManager:
                 port=target_port,
                 username=target_user, 
                 client_keys=client_keys, 
+                password=ssh_password,
                 known_hosts=None
             ) as conn:
                 

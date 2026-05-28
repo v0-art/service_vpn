@@ -159,6 +159,45 @@ class MarzbanManager:
                 return users
         return []
 
+    async def get_nodes(self) -> List[Dict[str, Any]]:
+        """Returns Marzban Nodes from the official GET /api/nodes endpoint."""
+        ok, payload, _, _ = await self._request("GET", "/api/nodes", timeout=20)
+        if not ok:
+            return []
+
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            nodes = payload.get("nodes") or payload.get("items")
+            if isinstance(nodes, list):
+                return [item for item in nodes if isinstance(item, dict)]
+        return []
+
+    async def get_node_settings(self) -> Dict[str, Any]:
+        """Returns Marzban node settings, including the client certificate."""
+        ok, payload, _, _ = await self._request("GET", "/api/node/settings", timeout=20)
+        if not ok or not isinstance(payload, dict):
+            return {}
+        return payload
+
+    async def get_nodes_usage(self, *, start: str = "", end: str = "") -> Dict[str, Any]:
+        path = "/api/nodes/usage"
+        query = []
+        if start:
+            query.append(f"start={start}")
+        if end:
+            query.append(f"end={end}")
+        if query:
+            path = f"{path}?{'&'.join(query)}"
+
+        ok, payload, _, _ = await self._request("GET", path, timeout=20)
+        if not ok or not isinstance(payload, dict):
+            return {"usages": []}
+        usages = payload.get("usages")
+        if not isinstance(usages, list):
+            payload["usages"] = []
+        return payload
+
     async def get_connection_status(self, force_reauth: bool = False) -> Dict[str, Any]:
         if force_reauth:
             self.token = None

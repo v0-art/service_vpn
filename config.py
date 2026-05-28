@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     SSH_DEFAULT_USER: str = "root"
     SSH_KEY_PATH: str = os.path.expanduser("~/.ssh/id_rsa")
     SSH_PORT: int = 2222
+    MASTER_SECRET_KEY: str = ""
 
     # Web
     WEB_HOST: str = "127.0.0.1"

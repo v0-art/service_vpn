@@ -17,6 +17,8 @@ from db.database import get_db_connection
 from services.deployer import deployer
 from services.haproxy_manager import haproxy_manager
 from services.marzban import marzban_manager
+from services.marzban_sync import INBOUND_ROLE_MAP, sync_marzban_inventory, sync_single_marzban_node
+from services.secrets import secret_manager
 from services.ssh_manager import ssh_manager
 
 logger = logging.getLogger(__name__)
@@ -162,6 +164,8 @@ class NodeCreate(BaseModel):
     role: str
     billing_date: str
     ssh_key: Optional[str] = None
+    ssh_password: Optional[str] = None
+    ssh_username: str = Field(default=config.SSH_DEFAULT_USER, min_length=1, max_length=64)
     ssh_port: int = Field(default=config.SSH_PORT, ge=1, le=65535)
     inbound_tag: str
     inbound_port: int = Field(ge=1, le=65535)
@@ -178,6 +182,8 @@ class NodeUpdate(BaseModel):
     role: Optional[str] = None
     billing_date: Optional[str] = None
     ssh_key: Optional[str] = None
+    ssh_password: Optional[str] = None
+    ssh_username: Optional[str] = Field(default=None, min_length=1, max_length=64)
     ssh_port: Optional[int] = Field(default=None, ge=1, le=65535)
     status: Optional[str] = None
     inbound_tag: Optional[str] = None
@@ -189,6 +195,23 @@ class NodeUpdate(BaseModel):
 
 class NodeDeleteRequest(BaseModel):
     cleanup_remote: bool = True
+
+
+class NodeCredentialsUpdate(BaseModel):
+    ssh_username: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    ssh_key: Optional[str] = None
+    ssh_password: Optional[str] = None
+    ssh_port: Optional[int] = Field(default=None, ge=1, le=65535)
+
+
+class MarzbanNodeImportRequest(BaseModel):
+    marzban_node_id: Optional[int] = None
+    address: Optional[str] = None
+    billing_date: Optional[str] = None
+    ssh_username: str = Field(default=config.SSH_DEFAULT_USER, min_length=1, max_length=64)
+    ssh_key: Optional[str] = None
+    ssh_password: Optional[str] = None
+    ssh_port: int = Field(default=config.SSH_PORT, ge=1, le=65535)
 
 
 class HAProxyUpdate(BaseModel):
@@ -224,15 +247,50 @@ async def get_nodes() -> List[Dict[str, Any]]:
                 """
                 SELECT
                     id, name, ip, role, billing_date, status,
-                    ssh_key, ssh_port,
+                    ssh_key, ssh_password, ssh_username, ssh_port, credential_status,
                     inbound_tag, inbound_port, group_sni, fingerprint,
                     marzban_node_id, marzban_node_status, marzban_last_error,
+                    marzban_node_name, marzban_node_port, marzban_node_api_port,
+                    marzban_usage_coefficient, last_marzban_sync,
                     provision_status
                 FROM nodes
                 ORDER BY id DESC
                 """
             ) as cursor:
                 rows = await cursor.fetchall()
+                node_ids = [int(row["id"]) for row in rows]
+
+                roles_by_node: Dict[int, List[str]] = {node_id: [] for node_id in node_ids}
+                inbounds_by_node: Dict[int, List[Dict[str, Any]]] = {node_id: [] for node_id in node_ids}
+
+                if node_ids:
+                    placeholders = ",".join("?" for _ in node_ids)
+                    async with db.execute(
+                        f"SELECT node_id, role FROM node_roles WHERE node_id IN ({placeholders}) ORDER BY role",
+                        node_ids,
+                    ) as roles_cursor:
+                        role_rows = await roles_cursor.fetchall()
+                        for role_row in role_rows:
+                            roles_by_node.setdefault(int(role_row["node_id"]), []).append(str(role_row["role"]))
+
+                    async with db.execute(
+                        f"""
+                        SELECT
+                            id, node_id, inbound_tag, remark, address, port,
+                            sni, host, fingerprint, security, alpn,
+                            is_disabled, original_remark, updated_at
+                        FROM node_inbounds
+                        WHERE node_id IN ({placeholders})
+                        ORDER BY inbound_tag, remark
+                        """,
+                        node_ids,
+                    ) as inbounds_cursor:
+                        inbound_rows = await inbounds_cursor.fetchall()
+                        for inbound_row in inbound_rows:
+                            inbound_dict = dict(inbound_row)
+                            inbound_dict["is_disabled"] = bool(inbound_dict.get("is_disabled"))
+                            inbounds_by_node.setdefault(int(inbound_dict["node_id"]), []).append(inbound_dict)
+
                 result = []
                 for row in rows:
                     node_dict = dict(row)
@@ -243,8 +301,18 @@ async def get_nodes() -> List[Dict[str, Any]]:
                     node_dict["fingerprint"] = node_dict.get("fingerprint") or "chrome"
                     node_dict["provision_status"] = node_dict.get("provision_status") or "pending"
                     node_dict["marzban_node_status"] = node_dict.get("marzban_node_status") or "unknown"
+                    node_dict["ssh_username"] = node_dict.get("ssh_username") or config.SSH_DEFAULT_USER
                     node_dict["has_ssh_key"] = bool(node_dict.get("ssh_key"))
+                    node_dict["has_ssh_password"] = bool(node_dict.get("ssh_password"))
+                    node_dict["has_credentials"] = bool(node_dict["has_ssh_key"] or node_dict["has_ssh_password"])
+                    node_dict["credential_status"] = (
+                        node_dict.get("credential_status")
+                        or ("configured" if node_dict["has_credentials"] else "missing")
+                    )
+                    node_dict["roles"] = roles_by_node.get(int(node_dict["id"]), [])
+                    node_dict["inbounds"] = inbounds_by_node.get(int(node_dict["id"]), [])
                     node_dict.pop("ssh_key", None)
+                    node_dict.pop("ssh_password", None)
                     result.append(node_dict)
                 return result
     except Exception as exc:
@@ -268,28 +336,38 @@ async def add_node(node: NodeCreate) -> Dict[str, Any]:
             else:
                 mode_raw = "existing"
 
-        final_ssh_key = node.ssh_key
-        if not final_ssh_key:
+        final_ssh_key = node.ssh_key.strip() if isinstance(node.ssh_key, str) else node.ssh_key
+        final_ssh_password = (
+            node.ssh_password.strip() if isinstance(node.ssh_password, str) and node.ssh_password.strip() else None
+        )
+        if not final_ssh_key and not final_ssh_password:
             generated = asyncssh.generate_private_key("ssh-rsa", key_size=2048)
             final_ssh_key = generated.export_private_key().decode("utf-8")
+
+        stored_ssh_key = secret_manager.encrypt(final_ssh_key) if final_ssh_key else None
+        stored_ssh_password = secret_manager.encrypt(final_ssh_password) if final_ssh_password else None
+        credential_status = "configured" if stored_ssh_key or stored_ssh_password else "missing"
 
         async with get_db_connection() as db:
             cursor = await db.execute(
                 """
                 INSERT INTO nodes (
                     name, ip, role, billing_date, status,
-                    ssh_key, ssh_port,
+                    ssh_key, ssh_password, ssh_username, ssh_port, credential_status,
                     inbound_tag, inbound_port, group_sni, fingerprint,
                     provision_status
-                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     node.name.strip(),
                     node.ip,
                     node.role,
                     node.billing_date,
-                    final_ssh_key,
+                    stored_ssh_key,
+                    stored_ssh_password,
+                    node.ssh_username.strip() or config.SSH_DEFAULT_USER,
                     node.ssh_port,
+                    credential_status,
                     node.inbound_tag,
                     int(node.inbound_port),
                     node.group_sni.strip(),
@@ -299,6 +377,50 @@ async def add_node(node: NodeCreate) -> Dict[str, Any]:
             )
             await db.commit()
             node_id = int(cursor.lastrowid)
+
+            role_flag = "master" if node.role == "master" else INBOUND_ROLE_MAP.get(node.inbound_tag)
+            if role_flag:
+                await db.execute(
+                    "INSERT OR IGNORE INTO node_roles (node_id, role, created_at) VALUES (?, ?, ?)",
+                    (node_id, role_flag, int(time.time())),
+                )
+
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO node_inbounds (
+                    node_id, inbound_tag, remark, address, port,
+                    sni, host, fingerprint, security, is_disabled,
+                    original_remark, raw_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'tls', 0, ?, ?, ?)
+                """,
+                (
+                    node_id,
+                    node.inbound_tag,
+                    node.name.strip(),
+                    node.ip,
+                    int(node.inbound_port),
+                    node.group_sni.strip(),
+                    node.group_sni.strip(),
+                    node.fingerprint.strip(),
+                    node.name.strip(),
+                    json.dumps(
+                        {
+                            "remark": node.name.strip(),
+                            "address": node.ip,
+                            "port": int(node.inbound_port),
+                            "sni": node.group_sni.strip(),
+                            "host": node.group_sni.strip(),
+                            "fingerprint": node.fingerprint.strip(),
+                            "security": "tls",
+                            "is_disabled": False,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    int(time.time()),
+                ),
+            )
+            await db.commit()
 
         if mode_raw == "existing":
             async with get_db_connection() as db:
@@ -386,7 +508,7 @@ async def update_node(node_id: int, node: NodeUpdate) -> Dict[str, Any]:
                 """
                 SELECT
                     id, name, ip, role, billing_date, status,
-                    ssh_key, ssh_port,
+                    ssh_key, ssh_password, ssh_username, ssh_port, credential_status,
                     inbound_tag, inbound_port, group_sni, fingerprint,
                     marzban_node_id, marzban_node_status, marzban_last_error,
                     provision_status
@@ -401,18 +523,27 @@ async def update_node(node_id: int, node: NodeUpdate) -> Dict[str, Any]:
 
             merged = dict(existing)
             for key, value in payload.items():
-                if key == "ssh_key":
+                if key in {"ssh_key", "ssh_password"}:
                     if value is None:
                         continue
                     if isinstance(value, str) and not value.strip():
                         continue
+                    merged[key] = secret_manager.encrypt(value.strip())
+                    continue
+                if key == "ssh_username" and isinstance(value, str):
+                    merged[key] = value.strip() or config.SSH_DEFAULT_USER
+                    continue
                 merged[key] = value
+
+            merged["credential_status"] = (
+                "configured" if merged.get("ssh_key") or merged.get("ssh_password") else "missing"
+            )
 
             await db.execute(
                 """
                 UPDATE nodes
                 SET name = ?, ip = ?, role = ?, billing_date = ?, status = ?,
-                    ssh_key = ?, ssh_port = ?,
+                    ssh_key = ?, ssh_password = ?, ssh_username = ?, ssh_port = ?, credential_status = ?,
                     inbound_tag = ?, inbound_port = ?, group_sni = ?, fingerprint = ?
                 WHERE id = ?
                 """,
@@ -423,7 +554,10 @@ async def update_node(node_id: int, node: NodeUpdate) -> Dict[str, Any]:
                     merged["billing_date"],
                     merged["status"],
                     merged["ssh_key"],
+                    merged.get("ssh_password"),
+                    merged.get("ssh_username") or config.SSH_DEFAULT_USER,
                     int(merged["ssh_port"]),
+                    merged["credential_status"],
                     merged["inbound_tag"],
                     int(merged["inbound_port"] or 0),
                     merged["group_sni"],
@@ -431,6 +565,60 @@ async def update_node(node_id: int, node: NodeUpdate) -> Dict[str, Any]:
                     node_id,
                 ),
             )
+
+            async with db.execute(
+                "SELECT COUNT(*) AS count FROM node_inbounds WHERE node_id = ?",
+                (node_id,),
+            ) as inbounds_count_cursor:
+                inbounds_count_row = await inbounds_count_cursor.fetchone()
+                inbounds_count = int(inbounds_count_row["count"] or 0)
+
+            if inbounds_count <= 1:
+                await db.execute("DELETE FROM node_roles WHERE node_id = ?", (node_id,))
+                await db.execute("DELETE FROM node_inbounds WHERE node_id = ?", (node_id,))
+
+                role_flag = "master" if merged["role"] == "master" else INBOUND_ROLE_MAP.get(str(merged["inbound_tag"]))
+                if role_flag:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO node_roles (node_id, role, created_at) VALUES (?, ?, ?)",
+                        (node_id, role_flag, int(time.time())),
+                    )
+
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO node_inbounds (
+                        node_id, inbound_tag, remark, address, port,
+                        sni, host, fingerprint, security, is_disabled,
+                        original_remark, raw_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'tls', 0, ?, ?, ?)
+                    """,
+                    (
+                        node_id,
+                        str(merged["inbound_tag"]),
+                        str(merged["name"]),
+                        str(merged["ip"]),
+                        int(merged["inbound_port"] or 443),
+                        str(merged["group_sni"] or ""),
+                        str(merged["group_sni"] or ""),
+                        str(merged["fingerprint"] or "chrome"),
+                        str(merged["name"]),
+                        json.dumps(
+                            {
+                                "remark": str(merged["name"]),
+                                "address": str(merged["ip"]),
+                                "port": int(merged["inbound_port"] or 443),
+                                "sni": str(merged["group_sni"] or ""),
+                                "host": str(merged["group_sni"] or ""),
+                                "fingerprint": str(merged["fingerprint"] or "chrome"),
+                                "security": "tls",
+                                "is_disabled": False,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        int(time.time()),
+                    ),
+                )
             await db.commit()
 
         if reconnect_marzban:
@@ -487,6 +675,14 @@ async def delete_node(node_id: int, payload: NodeDeleteRequest) -> Dict[str, Any
             ) as cursor:
                 row = await cursor.fetchone()
 
+            inbounds_rows = []
+            if row:
+                async with db.execute(
+                    "SELECT inbound_tag, remark, address FROM node_inbounds WHERE node_id = ?",
+                    (node_id,),
+                ) as inbounds_cursor:
+                    inbounds_rows = await inbounds_cursor.fetchall()
+
         if not row:
             raise HTTPException(status_code=404, detail="Сервер не найден.")
 
@@ -498,6 +694,7 @@ async def delete_node(node_id: int, payload: NodeDeleteRequest) -> Dict[str, Any
             inbound_tag=node.get("inbound_tag"),
             marzban_node_id=node.get("marzban_node_id"),
             cleanup_on_node=payload.cleanup_remote,
+            inbounds=[dict(item) for item in inbounds_rows],
         )
 
         return result
@@ -520,6 +717,7 @@ async def get_status_overview() -> Dict[str, Any]:
             """
             SELECT
                 id, name, ip, role, status, ssh_port,
+                credential_status,
                 inbound_tag, provision_status, marzban_node_status, marzban_last_error
             FROM nodes
             ORDER BY id ASC
@@ -539,6 +737,7 @@ async def get_status_overview() -> Dict[str, Any]:
         node_ip = str(node.get("ip", ""))
         node_status = str(node.get("status", "offline"))
         node_port = int(node.get("ssh_port") or config.SSH_PORT)
+        credential_status = str(node.get("credential_status") or "missing")
 
         if node_status != "active":
             return {
@@ -548,6 +747,7 @@ async def get_status_overview() -> Dict[str, Any]:
                 "role": node.get("role"),
                 "status": node_status,
                 "ssh_port": node_port,
+                "credential_status": credential_status,
                 "inbound_tag": node.get("inbound_tag"),
                 "provision_status": node.get("provision_status"),
                 "marzban_node_status": node.get("marzban_node_status"),
@@ -555,6 +755,24 @@ async def get_status_overview() -> Dict[str, Any]:
                 "checked": False,
                 "connected": False,
                 "error": "Сервер помечен как неактивный.",
+            }
+
+        if credential_status != "configured":
+            return {
+                "id": node.get("id"),
+                "name": node.get("name"),
+                "ip": node_ip,
+                "role": node.get("role"),
+                "status": node_status,
+                "ssh_port": node_port,
+                "credential_status": credential_status,
+                "inbound_tag": node.get("inbound_tag"),
+                "provision_status": node.get("provision_status"),
+                "marzban_node_status": node.get("marzban_node_status"),
+                "marzban_last_error": node.get("marzban_last_error"),
+                "checked": False,
+                "connected": False,
+                "error": "Требуется SSH ключ или пароль.",
             }
 
         async with semaphore:
@@ -571,6 +789,7 @@ async def get_status_overview() -> Dict[str, Any]:
             "role": node.get("role"),
             "status": node_status,
             "ssh_port": node_port,
+            "credential_status": credential_status,
             "inbound_tag": node.get("inbound_tag"),
             "provision_status": node.get("provision_status"),
             "marzban_node_status": node.get("marzban_node_status"),
@@ -626,6 +845,113 @@ async def reconnect_marzban() -> Dict[str, Any]:
         "message": result.get("error") or "Не удалось восстановить подключение к Marzban.",
         "connection": result,
     }
+
+
+@router.get("/marzban/nodes")
+async def get_marzban_nodes() -> Dict[str, Any]:
+    """
+    Returns raw Marzban Nodes and Hosts for import/diagnostics UI.
+    """
+    nodes = await marzban_manager.get_nodes()
+    hosts = await marzban_manager.get_hosts()
+    return {"nodes": nodes, "hosts": hosts}
+
+
+@router.post("/marzban/import")
+async def import_marzban_inventory() -> Dict[str, Any]:
+    """
+    Imports all Marzban Nodes and their inbound host bindings into LUFFY.
+    """
+    return await sync_marzban_inventory()
+
+
+@router.post("/marzban/import/node")
+async def import_single_marzban_inventory_node(payload: MarzbanNodeImportRequest) -> Dict[str, Any]:
+    """
+    Imports one selected Marzban Node with all matching inbound host bindings.
+    """
+    if payload.marzban_node_id is None and not (payload.address or "").strip():
+        raise HTTPException(status_code=400, detail="Выберите Marzban Node для импорта.")
+
+    result = await sync_single_marzban_node(
+        marzban_node_id=payload.marzban_node_id,
+        address=(payload.address or "").strip() or None,
+        ssh_username=payload.ssh_username,
+        ssh_key=payload.ssh_key,
+        ssh_password=payload.ssh_password,
+        ssh_port=payload.ssh_port,
+        billing_date=payload.billing_date,
+    )
+
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message") or "Не удалось импортировать Marzban Node.")
+
+    return result
+
+
+@router.put("/nodes/{node_id}/credentials")
+async def update_node_credentials(node_id: int, payload: NodeCredentialsUpdate) -> Dict[str, Any]:
+    """
+    Updates SSH connection credentials without exposing stored secrets.
+    """
+    update_payload = payload.model_dump(exclude_unset=True)
+    if not update_payload:
+        raise HTTPException(status_code=400, detail="Нет данных для обновления SSH доступа.")
+
+    try:
+        async with get_db_connection() as db:
+            async with db.execute(
+                "SELECT id, name, ssh_key, ssh_password FROM nodes WHERE id = ?",
+                (node_id,),
+            ) as cursor:
+                existing = await cursor.fetchone()
+
+            if not existing:
+                raise HTTPException(status_code=404, detail="Сервер не найден.")
+
+            fields: Dict[str, Any] = {}
+            if "ssh_username" in update_payload:
+                username = str(update_payload["ssh_username"]).strip()
+                if not username:
+                    raise HTTPException(status_code=400, detail="SSH username не может быть пустым.")
+                fields["ssh_username"] = username
+
+            if "ssh_port" in update_payload:
+                fields["ssh_port"] = int(update_payload["ssh_port"])
+
+            if "ssh_key" in update_payload:
+                ssh_key = update_payload.get("ssh_key")
+                if isinstance(ssh_key, str) and ssh_key.strip():
+                    fields["ssh_key"] = secret_manager.encrypt(ssh_key.strip())
+
+            if "ssh_password" in update_payload:
+                ssh_password = update_payload.get("ssh_password")
+                if isinstance(ssh_password, str) and ssh_password.strip():
+                    fields["ssh_password"] = secret_manager.encrypt(ssh_password.strip())
+
+            has_key = bool(fields.get("ssh_key") or existing["ssh_key"])
+            has_password = bool(fields.get("ssh_password") or existing["ssh_password"])
+            fields["credential_status"] = "configured" if has_key or has_password else "missing"
+
+            if not fields:
+                raise HTTPException(status_code=400, detail="Нет применимых данных для обновления SSH доступа.")
+
+            assignments = ", ".join(f"{field} = ?" for field in fields)
+            values = list(fields.values())
+            values.append(node_id)
+            await db.execute(f"UPDATE nodes SET {assignments} WHERE id = ?", values)
+            await db.commit()
+
+        return {
+            "status": "success",
+            "message": f"SSH доступ для сервера {existing['name']} обновлен.",
+            "credential_status": fields["credential_status"],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Ошибка обновления SSH credentials node_id=%s: %s", node_id, exc)
+        raise HTTPException(status_code=400, detail="Не удалось обновить SSH доступ.")
 
 
 @router.post("/haproxy/apply")

@@ -24,8 +24,11 @@ import {
   applyHAProxyConfig,
   deleteNode,
   fetchMarzbanConnection,
+  fetchMarzbanNodes,
   fetchNodes,
   fetchSystemOverview,
+  importMarzbanNode,
+  importMarzbanInventory,
   isTelegramContext,
   reconnectMarzban,
   updateNode,
@@ -36,6 +39,8 @@ import { SystemLogs } from './components/SystemLogs';
 import {
   InboundTag,
   MarzbanConnection,
+  MarzbanHost,
+  MarzbanNode,
   Node as AppNode,
   NodeConnectionStatus,
   NodeCreatePayload,
@@ -49,6 +54,14 @@ type Tab = 'inventory' | 'deploy' | 'haproxy' | 'marzban' | 'security' | 'logs';
 type Banner = {
   type: 'success' | 'error' | 'info';
   text: string;
+};
+
+type ConfirmAction = {
+  title: string;
+  text: string;
+  confirmLabel: string;
+  danger?: boolean;
+  onConfirm: () => Promise<void> | void;
 };
 
 const roleLabels: Record<NodeRole, string> = {
@@ -77,6 +90,73 @@ const navItems: Array<{ tab: Tab; label: string; icon: React.ComponentType<{ cla
 
 function normalizeError(error: string): string {
   return error.replace(/^Error:\s*/i, '').trim();
+}
+
+function credentialLabel(node: AppNode): string {
+  if (node.has_ssh_key && node.has_ssh_password) {
+    return 'ключ + пароль';
+  }
+  if (node.has_ssh_key) {
+    return 'ключ';
+  }
+  if (node.has_ssh_password) {
+    return 'пароль';
+  }
+  return 'требуется доступ';
+}
+
+function roleListLabel(node: AppNode): string {
+  if (node.roles && node.roles.length > 0) {
+    return node.roles.join(', ');
+  }
+  return roleLabels[node.role];
+}
+
+function marzbanNodeId(node: MarzbanNode): number | undefined {
+  if (node.id === undefined || node.id === null || node.id === '') {
+    return undefined;
+  }
+
+  const parsed = Number(node.id);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function marzbanNodeAddress(node: MarzbanNode): string {
+  return String(node.address || node.ip || node.host || '').trim();
+}
+
+function marzbanNodeName(node: MarzbanNode): string {
+  const address = marzbanNodeAddress(node);
+  return String(node.name || node.remark || address || 'Marzban Node').trim();
+}
+
+function marzbanNodeKey(node: MarzbanNode): string {
+  const id = marzbanNodeId(node);
+  if (id !== undefined) {
+    return `id:${id}`;
+  }
+  return `address:${marzbanNodeAddress(node)}`;
+}
+
+function hostListForNode(hosts: Record<string, unknown>, address: string): Array<{ inboundTag: string; host: MarzbanHost }> {
+  const result: Array<{ inboundTag: string; host: MarzbanHost }> = [];
+  for (const [inboundTag, group] of Object.entries(hosts)) {
+    if (!Array.isArray(group)) {
+      continue;
+    }
+
+    for (const item of group) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+
+      const host = item as MarzbanHost;
+      if (String(host.address || '').trim() === address) {
+        result.push({ inboundTag, host });
+      }
+    }
+  }
+  return result;
 }
 
 function calculateAppScale(width: number, height: number): number {
@@ -144,6 +224,8 @@ export default function App() {
   const [appScale, setAppScale] = useState(1);
   const [marzbanConn, setMarzbanConn] = useState<MarzbanConnection | null>(null);
   const [reconnectBusy, setReconnectBusy] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
 
   const inTelegram = isTelegramContext();
 
@@ -231,22 +313,41 @@ export default function App() {
     await loadMarzbanConn();
   };
 
-  const handleDeleteNode = async (node: AppNode) => {
-    const ok = window.confirm(
-      `Удалить сервер \"${node.name}\" (${node.ip})?\n\nБудет удален из панели, из Marzban и выполнится cleanup на ноде по SSH.`
-    );
-    if (!ok) {
-      return;
-    }
+  const runMarzbanImport = async () => {
+    setImportBusy(true);
+    const res = await importMarzbanInventory();
+    setImportBusy(false);
 
-    const res = await deleteNode(node.id, true);
-    if (res.success) {
-      setBanner({ type: 'success', text: res.data?.message || `Сервер ${node.name} удален.` });
+    if (res.success && res.data) {
+      const unmatched = res.data.unmatched_hosts?.length || 0;
+      setBanner({
+        type: unmatched > 0 ? 'info' : 'success',
+        text: `${res.data.message || 'Импорт Marzban завершен.'} Добавлено: ${res.data.imported}, обновлено: ${res.data.updated}, inbound: ${res.data.inbounds}${unmatched ? `, hosts без node: ${unmatched}` : ''}.`,
+      });
       await refreshAll();
       return;
     }
 
-    setBanner({ type: 'error', text: `Не удалось удалить сервер: ${normalizeError(res.error || 'неизвестная ошибка')}` });
+    setBanner({ type: 'error', text: `Импорт Marzban не выполнен: ${normalizeError(res.error || 'неизвестная ошибка')}` });
+  };
+
+  const handleDeleteNode = async (node: AppNode) => {
+    setConfirmAction({
+      title: 'Удалить сервер',
+      text: `Сервер "${node.name}" (${node.ip}) будет удален из панели, Marzban и очищен по SSH, если доступ есть.`,
+      confirmLabel: 'Удалить',
+      danger: true,
+      onConfirm: async () => {
+        const res = await deleteNode(node.id, true);
+        if (res.success) {
+          setBanner({ type: 'success', text: res.data?.message || `Сервер ${node.name} удален.` });
+          await refreshAll();
+          return;
+        }
+
+        setBanner({ type: 'error', text: `Не удалось удалить сервер: ${normalizeError(res.error || 'неизвестная ошибка')}` });
+      },
+    });
   };
 
   if (!inTelegram) {
@@ -363,6 +464,20 @@ export default function App() {
                 </button>
               )}
               <button
+                onClick={() =>
+                  setConfirmAction({
+                    title: 'Импорт Marzban',
+                    text: 'LUFFY перечитает все Marzban Nodes и inbound hosts, сопоставит их по IP и обновит локальный инвентарь без изменения Marzban.',
+                    confirmLabel: 'Импортировать',
+                    onConfirm: runMarzbanImport,
+                  })
+                }
+                disabled={importBusy}
+                className="px-3 py-2 border border-app-border rounded-md text-xs font-semibold cursor-pointer transition-opacity hover:opacity-80 flex items-center gap-2 text-app-text disabled:opacity-60"
+              >
+                <Network className={`w-3.5 h-3.5 ${importBusy ? 'animate-pulse' : ''}`} /> Импорт Marzban
+              </button>
+              <button
                 onClick={refreshAll}
                 className="px-4 py-2 border border-app-border rounded-md text-xs font-semibold cursor-pointer transition-opacity hover:opacity-80 flex items-center gap-2 text-app-text"
               >
@@ -465,6 +580,15 @@ export default function App() {
           />
         )}
       </AnimatePresence>
+
+      <AnimatePresence>
+        {confirmAction && (
+          <ConfirmDialog
+            action={confirmAction}
+            onClose={() => setConfirmAction(null)}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -488,6 +612,58 @@ function StatusBadge({
       <span className="hidden sm:inline">{label}</span>{' '}
       <span className={`font-semibold ${ok ? 'text-app-success' : 'text-app-danger'}`}>{ok ? okText : badText}</span>
     </div>
+  );
+}
+
+function ConfirmDialog({ action, onClose }: { action: ConfirmAction; onClose: () => void }) {
+  const [busy, setBusy] = useState(false);
+
+  const confirm = async () => {
+    setBusy(true);
+    try {
+      await action.onConfirm();
+      onClose();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <motion.div className="fixed inset-0 z-[60]" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+      <button className="absolute inset-0 bg-black/70" onClick={busy ? undefined : onClose} aria-label="Закрыть подтверждение" />
+      <div className="relative z-10 min-h-screen p-4 flex items-center justify-center">
+        <motion.div
+          initial={{ y: 24, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          exit={{ y: 18, opacity: 0 }}
+          className="w-full max-w-md bg-app-card border border-app-border rounded-lg"
+        >
+          <div className="p-4 border-b border-app-border flex items-center justify-between">
+            <div className="text-sm font-semibold uppercase tracking-wide text-app-muted">{action.title}</div>
+            <button onClick={busy ? undefined : onClose} className="p-1.5 border border-app-border rounded">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="p-4 text-sm text-app-text/90 leading-relaxed">{action.text}</div>
+          <div className="grid grid-cols-2 gap-3 p-4 border-t border-app-border">
+            <button type="button" onClick={onClose} disabled={busy} className="w-full border border-app-border text-app-text font-semibold py-2.5 rounded-md text-[13px] disabled:opacity-50">
+              Отмена
+            </button>
+            <button
+              type="button"
+              onClick={confirm}
+              disabled={busy}
+              className={`w-full font-semibold py-2.5 rounded-md text-[13px] disabled:opacity-50 flex items-center justify-center gap-2 ${
+                action.danger ? 'bg-app-danger text-white' : 'bg-app-accent text-black'
+              }`}
+            >
+              {busy ? <RefreshCw className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+              {busy ? 'Выполняется...' : action.confirmLabel}
+            </button>
+          </div>
+        </motion.div>
+      </div>
+    </motion.div>
   );
 }
 
@@ -562,10 +738,10 @@ function InventoryView({
                 </div>
                 <NodeStatusBadge node={node} connection={connectionByIp.get(node.ip)} />
               </div>
-              <div className="mt-2 text-xs text-app-muted">Роль: {roleLabels[node.role]}</div>
-              <div className="mt-1 text-xs text-app-muted">Inbound: {node.inbound_tag}</div>
+              <div className="mt-2 text-xs text-app-muted">Роли: {roleListLabel(node)}</div>
+              <div className="mt-1 text-xs text-app-muted">Inbound: {node.inbounds?.length ? `${node.inbounds.length} привязок` : node.inbound_tag}</div>
               <div className="mt-1 text-xs text-app-muted">SNI/порт: {node.group_sni}:{node.inbound_port}</div>
-              <div className="mt-1 text-xs text-app-muted">Ключ: {node.has_ssh_key ? 'загружен' : 'отсутствует'}</div>
+              <div className="mt-1 text-xs text-app-muted">SSH: {node.ssh_username || 'root'}@{node.ssh_port}, {credentialLabel(node)}</div>
 
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <button
@@ -602,19 +778,19 @@ const NodeRow: React.FC<{
         <span className="font-mono text-app-accent font-medium">{node.ip}</span>
       </td>
       <td className="p-4 border-b border-app-border text-[13px]">
-        <span className="opacity-80">{roleLabels[node.role]}</span>
+        <span className="opacity-80">{roleListLabel(node)}</span>
       </td>
       <td className="p-4 border-b border-app-border text-[13px] font-mono opacity-80">
         {node.ssh_port}
         <div className="mt-1 text-[10px]">
-          {node.has_ssh_key ? (
-            <span className="inline-flex items-center gap-1 text-app-success"><Lock className="w-3 h-3" /> ключ OK</span>
+          {node.has_credentials ? (
+            <span className="inline-flex items-center gap-1 text-app-success"><Lock className="w-3 h-3" /> {credentialLabel(node)}</span>
           ) : (
-            <span className="inline-flex items-center gap-1 text-app-warning"><AlertCircle className="w-3 h-3" /> ключ отсутствует</span>
+            <span className="inline-flex items-center gap-1 text-app-warning"><AlertCircle className="w-3 h-3" /> нужен доступ</span>
           )}
         </div>
       </td>
-      <td className="p-4 border-b border-app-border text-[12px] font-mono">{node.inbound_tag}</td>
+      <td className="p-4 border-b border-app-border text-[12px] font-mono">{node.inbounds?.length ? `${node.inbounds.length} inbound` : node.inbound_tag}</td>
       <td className="p-4 border-b border-app-border text-[12px] font-mono">{node.group_sni}:{node.inbound_port}</td>
       <td className="p-4 border-b border-app-border text-[13px]">
         <NodeStatusBadge node={node} connection={connection} />
@@ -642,19 +818,92 @@ function DeployForm({
 }) {
   const [loading, setLoading] = useState(false);
   const [addMode, setAddMode] = useState<'existing' | 'new'>('existing');
+  const [marzbanLoading, setMarzbanLoading] = useState(false);
+  const [marzbanNodes, setMarzbanNodes] = useState<MarzbanNode[]>([]);
+  const [marzbanHosts, setMarzbanHosts] = useState<Record<string, unknown>>({});
+  const [selectedMarzbanKey, setSelectedMarzbanKey] = useState('');
+
+  const selectedMarzbanNode = useMemo(
+    () => marzbanNodes.find((node) => marzbanNodeKey(node) === selectedMarzbanKey) || null,
+    [marzbanNodes, selectedMarzbanKey]
+  );
+  const selectedMarzbanAddress = selectedMarzbanNode ? marzbanNodeAddress(selectedMarzbanNode) : '';
+  const selectedMarzbanHosts = useMemo(
+    () => hostListForNode(marzbanHosts, selectedMarzbanAddress),
+    [marzbanHosts, selectedMarzbanAddress]
+  );
+
+  const reloadMarzbanNodes = async () => {
+    setMarzbanLoading(true);
+    const snapshot = await fetchMarzbanNodes();
+    setMarzbanNodes(snapshot.nodes || []);
+    setMarzbanHosts(snapshot.hosts || {});
+    setSelectedMarzbanKey((current) => {
+      if (current && snapshot.nodes.some((node) => marzbanNodeKey(node) === current)) {
+        return current;
+      }
+      return snapshot.nodes[0] ? marzbanNodeKey(snapshot.nodes[0]) : '';
+    });
+    setMarzbanLoading(false);
+  };
+
+  useEffect(() => {
+    if (addMode === 'existing' && marzbanNodes.length === 0 && !marzbanLoading) {
+      reloadMarzbanNodes();
+    }
+  }, [addMode]);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setLoading(true);
 
     const formData = new FormData(e.currentTarget);
+    const sshKeyRaw = String(formData.get('ssh_key') || '');
+    const sshPasswordRaw = String(formData.get('ssh_password') || '');
+
+    if (addMode === 'existing') {
+      if (!selectedMarzbanNode || !selectedMarzbanAddress) {
+        setLoading(false);
+        onError('Выберите Marzban Node для импорта.');
+        return;
+      }
+
+      if (!sshKeyRaw.trim() && !sshPasswordRaw.trim()) {
+        setLoading(false);
+        onError('Добавьте SSH ключ или пароль для выбранной Marzban Node.');
+        return;
+      }
+
+      const res = await importMarzbanNode({
+        marzban_node_id: marzbanNodeId(selectedMarzbanNode),
+        address: selectedMarzbanAddress,
+        billing_date: String(formData.get('billing') || '').trim() || undefined,
+        ssh_username: String(formData.get('ssh_username') || 'root').trim(),
+        ssh_port: Number(formData.get('ssh_port') || 2222),
+        ssh_key: sshKeyRaw.trim() || undefined,
+        ssh_password: sshPasswordRaw.trim() || undefined,
+      });
+      setLoading(false);
+
+      if (res.success) {
+        const inboundText = typeof res.data?.inbounds === 'number' ? ` Inbound: ${res.data.inbounds}.` : '';
+        onSuccess(res.data?.message ? `${res.data.message}${inboundText}` : `Marzban Node ${marzbanNodeName(selectedMarzbanNode)} импортирована.`, res.data?.status === 'partial');
+        return;
+      }
+
+      onError(`Не удалось импортировать Marzban Node: ${normalizeError(res.error || 'Неизвестная ошибка')}`);
+      return;
+    }
+
     const payload: NodeCreatePayload = {
       name: String(formData.get('name') || '').trim(),
       ip: String(formData.get('ip') || '').trim(),
       role: formData.get('role') as NodeRole,
       billing_date: String(formData.get('billing') || '').trim(),
+      ssh_username: String(formData.get('ssh_username') || 'root').trim(),
       ssh_port: Number(formData.get('ssh_port') || 22),
-      ssh_key: (formData.get('ssh_key') as string) || undefined,
+      ssh_key: sshKeyRaw || undefined,
+      ssh_password: sshPasswordRaw || undefined,
       inbound_tag: formData.get('inbound_tag') as InboundTag,
       inbound_port: Number(formData.get('inbound_port') || 443),
       group_sni: String(formData.get('group_sni') || '').trim(),
@@ -729,79 +978,200 @@ function DeployForm({
             : 'Режим DEPLOY: будут изменения в инфраструктуре. Используй только для новых нод.'}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Имя сервера</label>
-            <input required type="text" name="name" placeholder="RU-Direct-1" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent" />
-          </div>
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">IPv4 адрес</label>
-            <input
-              required
-              type="text"
-              name="ip"
-              placeholder="0.0.0.0"
-              pattern="^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$"
-              className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono"
-            />
-          </div>
-
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Роль ноды</label>
-            <select name="role" defaultValue="ingress" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono">
-              <option value="ingress">INGRESS</option>
-              <option value="egress">EGRESS</option>
-              <option value="master">MASTER</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">SSH порт</label>
-            <input required type="number" min={1} max={65535} defaultValue={22} name="ssh_port" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
-          </div>
-
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Inbound группа</label>
-            <select name="inbound_tag" defaultValue="IN-RU-DIRECT" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono">
-              {inboundOptions.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
+        {addMode === 'existing' ? (
+          <>
+            <div>
+              <div className="flex items-center justify-between gap-3 mb-2">
+                <label className="block text-[11px] text-app-muted uppercase tracking-wide font-semibold">Marzban Node</label>
+                <button
+                  type="button"
+                  onClick={reloadMarzbanNodes}
+                  disabled={marzbanLoading}
+                  className="px-2.5 py-1.5 border border-app-border rounded text-[11px] font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${marzbanLoading ? 'animate-spin' : ''}`} />
+                  Обновить
+                </button>
+              </div>
+              <select
+                required
+                value={selectedMarzbanKey}
+                onChange={(event) => setSelectedMarzbanKey(event.target.value)}
+                disabled={marzbanLoading || marzbanNodes.length === 0}
+                className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono"
+              >
+                <option value="" disabled>
+                  {marzbanLoading ? 'Загрузка Marzban Nodes...' : 'Выберите Marzban Node...'}
                 </option>
-              ))}
-            </select>
-          </div>
+                {marzbanNodes.map((node) => {
+                  const address = marzbanNodeAddress(node);
+                  const status = String(node.status || 'unknown');
+                  return (
+                    <option key={marzbanNodeKey(node)} value={marzbanNodeKey(node)}>
+                      {marzbanNodeName(node)} • {address} • {status}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
 
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Порт inbound</label>
-            <input required type="number" min={1} max={65535} defaultValue={443} name="inbound_port" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
-          </div>
+            {selectedMarzbanNode && (
+              <div className="border border-app-border rounded-md bg-app-bg/40 p-3">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                  <div>
+                    <div className="text-app-muted uppercase text-[10px] font-semibold mb-1">IP</div>
+                    <div className="font-mono text-app-accent">{selectedMarzbanAddress}</div>
+                  </div>
+                  <div>
+                    <div className="text-app-muted uppercase text-[10px] font-semibold mb-1">Статус</div>
+                    <div className="font-mono">{String(selectedMarzbanNode.status || 'unknown')}</div>
+                  </div>
+                  <div>
+                    <div className="text-app-muted uppercase text-[10px] font-semibold mb-1">Inbound</div>
+                    <div className="font-mono">{selectedMarzbanHosts.length}</div>
+                  </div>
+                </div>
 
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">SNI группы</label>
-            <input required type="text" name="group_sni" placeholder="example.com" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
-          </div>
+                <div className="mt-3 space-y-1.5">
+                  {selectedMarzbanHosts.length === 0 ? (
+                    <div className="text-xs text-app-warning font-mono">hosts по IP этой Node не найдены</div>
+                  ) : (
+                    selectedMarzbanHosts.slice(0, 5).map((item, index) => (
+                      <div key={`${item.inboundTag}-${index}-${String(item.host.remark || item.host.address || item.host.sni)}`} className="text-[11px] font-mono text-app-muted flex flex-wrap gap-x-2">
+                        <span className="text-app-text">{item.inboundTag}</span>
+                        <span>{String(item.host.remark || 'без имени')}</span>
+                        <span>{String(item.host.sni || item.host.host || 'без SNI')}:{String(item.host.port || '443')}</span>
+                      </div>
+                    ))
+                  )}
+                  {selectedMarzbanHosts.length > 5 && (
+                    <div className="text-[11px] text-app-muted font-mono">+{selectedMarzbanHosts.length - 5} inbound</div>
+                  )}
+                </div>
+              </div>
+            )}
 
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Fingerprint</label>
-            <input required type="text" name="fingerprint" placeholder="chrome" defaultValue="chrome" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
-          </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">SSH пользователь</label>
+                <input required type="text" defaultValue="root" name="ssh_username" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
+              </div>
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">SSH порт</label>
+                <input required type="number" min={1} max={65535} defaultValue={2222} name="ssh_port" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
+              </div>
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Дата оплаты</label>
+                <input type="date" name="billing" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" style={{ colorScheme: 'dark' }} />
+              </div>
+            </div>
 
-          <div>
-            <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Дата оплаты</label>
-            <input required type="date" name="billing" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" style={{ colorScheme: 'dark' }} />
-          </div>
-        </div>
+            <div>
+              <label className="flex text-[11px] items-center justify-between font-semibold text-app-muted mb-2 uppercase tracking-wide">
+                <span>Приватный SSH ключ</span>
+                <span className="text-app-muted/70 lowercase font-normal italic">(ключ или пароль обязателен)</span>
+              </label>
+              <textarea name="ssh_key" rows={4} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..." className="w-full bg-app-bg border border-app-border rounded-md px-3 py-3 text-[11px] text-app-text/70 focus:outline-none focus:border-app-accent font-mono resize-none" />
+            </div>
 
-        <div>
-          <label className="flex text-[11px] items-center justify-between font-semibold text-app-muted mb-2 uppercase tracking-wide">
-            <span>Приватный SSH ключ</span>
-            <span className="text-app-muted/70 lowercase font-normal italic">(можно оставить пустым — ключ сгенерируется)</span>
-          </label>
-          <textarea name="ssh_key" rows={4} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..." className="w-full bg-app-bg border border-app-border rounded-md px-3 py-3 text-[11px] text-app-text/70 focus:outline-none focus:border-app-accent font-mono resize-none" />
-        </div>
+            <div>
+              <label className="flex text-[11px] items-center justify-between font-semibold text-app-muted mb-2 uppercase tracking-wide">
+                <span>SSH пароль</span>
+                <span className="text-app-muted/70 lowercase font-normal italic">(ключ или пароль обязателен)</span>
+              </label>
+              <input name="ssh_password" type="password" autoComplete="new-password" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text/70 focus:outline-none focus:border-app-accent font-mono" />
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Имя сервера</label>
+                <input required type="text" name="name" placeholder="RU-Direct-1" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent" />
+              </div>
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">IPv4 адрес</label>
+                <input
+                  required
+                  type="text"
+                  name="ip"
+                  placeholder="0.0.0.0"
+                  pattern="^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$"
+                  className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Роль ноды</label>
+                <select name="role" defaultValue="ingress" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono">
+                  <option value="ingress">INGRESS</option>
+                  <option value="egress">EGRESS</option>
+                  <option value="master">MASTER</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">SSH порт</label>
+                <input required type="number" min={1} max={65535} defaultValue={22} name="ssh_port" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">SSH пользователь</label>
+                <input required type="text" defaultValue="root" name="ssh_username" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Inbound группа</label>
+                <select name="inbound_tag" defaultValue="IN-RU-DIRECT" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono">
+                  {inboundOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Порт inbound</label>
+                <input required type="number" min={1} max={65535} defaultValue={443} name="inbound_port" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">SNI группы</label>
+                <input required type="text" name="group_sni" placeholder="example.com" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Fingerprint</label>
+                <input required type="text" name="fingerprint" placeholder="chrome" defaultValue="chrome" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Дата оплаты</label>
+                <input required type="date" name="billing" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" style={{ colorScheme: 'dark' }} />
+              </div>
+            </div>
+
+            <div>
+              <label className="flex text-[11px] items-center justify-between font-semibold text-app-muted mb-2 uppercase tracking-wide">
+                <span>Приватный SSH ключ</span>
+                <span className="text-app-muted/70 lowercase font-normal italic">(если нет пароля и ключа — ключ сгенерируется)</span>
+              </label>
+              <textarea name="ssh_key" rows={4} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..." className="w-full bg-app-bg border border-app-border rounded-md px-3 py-3 text-[11px] text-app-text/70 focus:outline-none focus:border-app-accent font-mono resize-none" />
+            </div>
+
+            <div>
+              <label className="flex text-[11px] items-center justify-between font-semibold text-app-muted mb-2 uppercase tracking-wide">
+                <span>SSH пароль</span>
+                <span className="text-app-muted/70 lowercase font-normal italic">(можно оставить пустым)</span>
+              </label>
+              <input name="ssh_password" type="password" autoComplete="new-password" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text/70 focus:outline-none focus:border-app-accent font-mono" />
+            </div>
+          </>
+        )}
 
         <button
-          disabled={loading}
+          disabled={loading || (addMode === 'existing' && (marzbanLoading || !selectedMarzbanNode))}
           type="submit"
           className="w-full bg-app-accent text-black font-semibold py-2.5 rounded-md text-[13px] hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
         >
@@ -809,10 +1179,10 @@ function DeployForm({
           {loading
             ? addMode === 'new'
               ? 'Деплой и подключение...'
-              : 'Добавление в панель...'
+              : 'Импорт Marzban Node...'
             : addMode === 'new'
             ? 'Добавить и задеплоить сервер'
-            : 'Добавить существующий сервер'}
+            : 'Импортировать выбранную Marzban Node'}
         </button>
       </form>
     </div>
@@ -838,12 +1208,14 @@ function EditNodeModal({
 
     const formData = new FormData(e.currentTarget);
     const sshKeyRaw = String(formData.get('ssh_key') || '');
+    const sshPasswordRaw = String(formData.get('ssh_password') || '');
 
     const payload: any = {
       name: String(formData.get('name') || '').trim(),
       ip: String(formData.get('ip') || '').trim(),
       role: formData.get('role') as NodeRole,
       billing_date: String(formData.get('billing') || '').trim(),
+      ssh_username: String(formData.get('ssh_username') || '').trim(),
       ssh_port: Number(formData.get('ssh_port') || 22),
       status: formData.get('status') as NodeStatus,
       inbound_tag: formData.get('inbound_tag') as InboundTag,
@@ -855,6 +1227,9 @@ function EditNodeModal({
 
     if (sshKeyRaw.trim()) {
       payload.ssh_key = sshKeyRaw;
+    }
+    if (sshPasswordRaw.trim()) {
+      payload.ssh_password = sshPasswordRaw;
     }
 
     const res = await updateNode(node.id, payload);
@@ -911,6 +1286,10 @@ function EditNodeModal({
                 <input required type="number" min={1} max={65535} name="ssh_port" defaultValue={node.ssh_port} className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
               </div>
               <div>
+                <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">SSH пользователь</label>
+                <input required type="text" name="ssh_username" defaultValue={node.ssh_username || 'root'} className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono" />
+              </div>
+              <div>
                 <label className="block text-[11px] text-app-muted mb-2 uppercase tracking-wide font-semibold">Inbound группа</label>
                 <select name="inbound_tag" defaultValue={node.inbound_tag} className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text focus:outline-none focus:border-app-accent font-mono">
                   {inboundOptions.map((opt) => (
@@ -956,6 +1335,14 @@ function EditNodeModal({
                 <span className="text-app-muted/70 lowercase font-normal italic">(оставьте пустым, чтобы не менять)</span>
               </label>
               <textarea name="ssh_key" rows={4} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..." className="w-full bg-app-bg border border-app-border rounded-md px-3 py-3 text-[11px] text-app-text/70 focus:outline-none focus:border-app-accent font-mono resize-none" />
+            </div>
+
+            <div>
+              <label className="flex text-[11px] items-center justify-between font-semibold text-app-muted mb-2 uppercase tracking-wide">
+                <span>Новый SSH пароль</span>
+                <span className="text-app-muted/70 lowercase font-normal italic">(оставьте пустым, чтобы не менять)</span>
+              </label>
+              <input name="ssh_password" type="password" autoComplete="new-password" className="w-full bg-app-bg border border-app-border rounded-md px-3 py-2 text-[13px] text-app-text/70 focus:outline-none focus:border-app-accent font-mono" />
             </div>
 
             <div className="grid grid-cols-2 gap-3 pt-2">

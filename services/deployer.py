@@ -6,6 +6,7 @@ from config import config
 from db.database import get_db_connection
 from services.ssh_manager import ssh_manager
 from services.marzban import marzban_manager
+from services.secrets import secret_manager
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +72,20 @@ class NodeDeployer:
                 await db.execute(
                     """
                     INSERT INTO nodes (
-                        name, ip, role, billing_date, status, ssh_key, ssh_port, provision_status
-                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, 'pending')
+                        name, ip, role, billing_date, status,
+                        ssh_key, ssh_username, ssh_port, credential_status,
+                        provision_status
+                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 'configured', 'pending')
                     """,
-                    (ip, ip, role, billing_date, private_key_str, config.SSH_PORT),
+                    (
+                        ip,
+                        ip,
+                        role,
+                        billing_date,
+                        secret_manager.encrypt(private_key_str),
+                        config.SSH_DEFAULT_USER,
+                        config.SSH_PORT,
+                    ),
                 )
                 await db.commit()
         except Exception as exc:
@@ -236,6 +247,7 @@ echo "LUFFY_BOOTSTRAP_OK"
         inbound_tag: Optional[str],
         marzban_node_id: Optional[int],
         cleanup_on_node: bool,
+        inbounds: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Удаление ноды:
@@ -245,7 +257,15 @@ echo "LUFFY_BOOTSTRAP_OK"
         """
         steps: List[Dict[str, Any]] = []
 
-        if inbound_tag:
+        if inbounds:
+            for inbound in inbounds:
+                host_remove = await marzban_manager.remove_host_from_group(
+                    inbound_tag=str(inbound.get("inbound_tag")),
+                    address=str(inbound.get("address") or ip),
+                    remark=str(inbound.get("remark") or name),
+                )
+                steps.append({"step": "marzban_remove_host", **host_remove})
+        elif inbound_tag:
             host_remove = await marzban_manager.remove_host_from_group(
                 inbound_tag=inbound_tag,
                 address=ip,

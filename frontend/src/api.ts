@@ -1,8 +1,13 @@
 import {
   ApiResponse,
   MarzbanConnection,
+  MarzbanInventorySnapshot,
+  MarzbanImportResult,
+  MarzbanNodeImportPayload,
+  MarzbanNodeImportResult,
   Node,
   NodeCreatePayload,
+  NodeCredentialsPayload,
   NodeUpdatePayload,
   SystemOverview,
 } from './types';
@@ -193,6 +198,67 @@ export async function reconnectMarzban(): Promise<ApiResponse<{ message?: string
       return { success: false, error: data?.message || 'Не удалось переподключиться к Marzban.' };
     }
 
+    return { success: true, data };
+  } catch (error) {
+    console.error(error);
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function importMarzbanInventory(): Promise<ApiResponse<MarzbanImportResult>> {
+  try {
+    const data = await apiRequest<MarzbanImportResult>('/marzban/import', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+
+    if (data?.status === 'error') {
+      return { success: false, error: data?.message || 'Не удалось импортировать Marzban.', data };
+    }
+
+    return { success: true, data };
+  } catch (error) {
+    console.error(error);
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function fetchMarzbanNodes(): Promise<MarzbanInventorySnapshot> {
+  try {
+    return await apiRequest<MarzbanInventorySnapshot>('/marzban/nodes');
+  } catch (error) {
+    console.error(error);
+    return { nodes: [], hosts: {} };
+  }
+}
+
+export async function importMarzbanNode(payload: MarzbanNodeImportPayload): Promise<ApiResponse<MarzbanNodeImportResult>> {
+  try {
+    const data = await apiRequest<MarzbanNodeImportResult>('/marzban/import/node', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+
+    if (data?.status === 'error') {
+      return { success: false, error: data?.message || 'Не удалось импортировать Marzban Node.', data };
+    }
+
+    return { success: true, data };
+  } catch (error) {
+    console.error(error);
+    return { success: false, error: String(error) };
+  }
+}
+
+export async function updateNodeCredentials(
+  nodeId: number,
+  payload: NodeCredentialsPayload
+): Promise<ApiResponse<{ message?: string; credential_status?: string }>> {
+  try {
+    const data = await apiRequest<{ status: string; message?: string; credential_status?: string }>(`/nodes/${nodeId}/credentials`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
     return { success: true, data };
   } catch (error) {
     console.error(error);
