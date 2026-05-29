@@ -1,4 +1,5 @@
 import logging
+import os
 import asyncssh
 from typing import Tuple, Optional, Any
 from config import config
@@ -16,6 +17,33 @@ class SSHManager:
         self.default_user: str = config.SSH_DEFAULT_USER
         self.key_path: str = config.SSH_KEY_PATH
         self.port: int = config.SSH_PORT
+
+    def fallback_key_paths(self) -> list[str]:
+        """
+        Возвращает доступные fallback SSH keys из контейнера/хоста.
+        Нужен для старых импортированных нод, где per-node credentials еще не
+        заведены, но общий ключ уже примонтирован в /root/.ssh.
+        """
+        candidates = [
+            self.key_path,
+            os.path.expanduser("~/.ssh/id_ed25519"),
+            os.path.expanduser("~/.ssh/id_rsa"),
+            os.path.expanduser("~/.ssh/id_ecdsa"),
+        ]
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            expanded = os.path.expanduser(str(candidate or "")).strip()
+            if not expanded or expanded in seen:
+                continue
+            seen.add(expanded)
+            if os.path.exists(expanded):
+                result.append(expanded)
+        return result
+
+    def has_fallback_key(self) -> bool:
+        return bool(self.fallback_key_paths())
 
     async def execute_command(
         self, 
@@ -67,10 +95,18 @@ class SSHManager:
                 logger.debug(f"Используется индивидуальный SSH-ключ для {host}")
             except Exception as e:
                 logger.error(f"Ошибка парсинга индивидуального SSH-ключа для {host}: {e}")
-                client_keys.append(self.key_path)
+                client_keys.extend(self.fallback_key_paths())
         else:
             if not ssh_password:
-                client_keys.append(self.key_path)
+                client_keys.extend(self.fallback_key_paths())
+
+        if not client_keys and not ssh_password:
+            error_msg = (
+                f"Нет SSH credentials для {target_user}@{host}:{target_port}: "
+                "не задан per-node ключ/пароль и fallback SSH key не найден."
+            )
+            logger.error(error_msg)
+            return False, error_msg
         
         try:
             # known_hosts=None позволяет подключаться к новым нодам без ручного подтверждения fingerprint.
@@ -114,7 +150,10 @@ class SSHManager:
             return False, error_msg
             
         except asyncssh.PermissionDenied:
-            error_msg = f"Отказано в доступе к {host}. Проверьте SSH-ключ ({self.key_path})."
+            error_msg = (
+                f"Отказано в доступе к {target_user}@{host}:{target_port}. "
+                "Проверьте SSH username, порт и ключ/пароль для этой ноды."
+            )
             logger.error(error_msg)
             return False, error_msg
             

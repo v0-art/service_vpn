@@ -757,7 +757,7 @@ async def get_status_overview() -> Dict[str, Any]:
                 "error": "Сервер помечен как неактивный.",
             }
 
-        if credential_status != "configured":
+        if credential_status != "configured" and not ssh_manager.has_fallback_key():
             return {
                 "id": node.get("id"),
                 "name": node.get("name"),

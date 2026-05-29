@@ -55,6 +55,9 @@ roles/inbound editor или перейти к метрикам и авто-ре�
   master/trusted IP и не повторяет уже отправленные события в рамках процесса.
 - Port Knocker больше не редактирует HAProxy автоматически; после 3 подряд
   неуспешных проверок он меняет статус в панели и отправляет alert.
+- SSH overview проверяет ноды через per-node credentials или через доступный
+  fallback key из `/root/.ssh`, поэтому общий примонтированный ключ учитывается
+  в счетчике SSH.
 - Можно вручную добавить сервер в инвентарь.
 - Можно редактировать параметры сервера в текущей старой модели.
 - Можно удалить сервер с попыткой удаления из Marzban и cleanup по SSH.
@@ -361,6 +364,9 @@ roles/inbound editor или перейти к метрикам и авто-ре�
 - `services/monitor.py:external_port_knocker` больше не выполняет `sed` по
   `haproxy.cfg` и `systemctl reload haproxy`; автоматическая реакция ограничена
   статусом панели и alert после 3 подряд неуспешных проверок.
+- `services/ssh_manager.py` теперь ищет доступные fallback keys
+  (`SSH_KEY_PATH`, `id_ed25519`, `id_rsa`, `id_ecdsa`), а `/status/overview`
+  не пропускает ноды с `credential_status=missing`, если fallback key доступен.
 - Добавлена настройка `SSH_AUDIT_TRUSTED_IPS` в `config.py` и `.env.example`.
 - Проверки: `py_compile`, `compileall`, `npm run lint`, `npm run build`,
   `git diff --check`; свежий build синхронизирован в `static/`.
