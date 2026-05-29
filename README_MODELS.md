@@ -6,7 +6,7 @@
 дополнять новыми записями без удаления полезного контекста.
 
 ## Актуальная стадия
-Дата последнего обновления: 2026-05-28.
+Дата последнего обновления: 2026-05-29.
 
 Приложение сейчас работает как Telegram Mini App с FastAPI backend, SQLite,
 Telegram-ботом, базовой интеграцией Marzban, ручным применением HAProxy и
@@ -46,6 +46,15 @@ roles/inbound editor или перейти к метрикам и авто-ре�
 - Форма "Существующий сервер" теперь читает `GET /api/marzban/nodes`, дает
   выбрать Marzban Node, показывает найденные inbound hosts по IP и отправляет
   SSH username/key/password в single-node import endpoint.
+- В Mini App есть вкладка `Мониторинг` со сводкой по серверам, SSH, Marzban и
+  состоянию нод.
+- Инвентарь показывает все inbound-привязки сервера, а не только количество.
+- Верхние счетчики берут локальный инвентарь как fallback, поэтому список
+  серверов не отображается как пустой при ошибке/задержке overview.
+- SSH audit фильтрует рутинные входы с текущего Control Tower source IP,
+  master/trusted IP и не повторяет уже отправленные события в рамках процесса.
+- Port Knocker больше не редактирует HAProxy автоматически; после 3 подряд
+  неуспешных проверок он меняет статус в панели и отправляет alert.
 - Можно вручную добавить сервер в инвентарь.
 - Можно редактировать параметры сервера в текущей старой модели.
 - Можно удалить сервер с попыткой удаления из Marzban и cleanup по SSH.
@@ -337,3 +346,21 @@ roles/inbound editor или перейти к метрикам и авто-ре�
   single-node import against real Marzban,
   SSH login по key/password,
   full FastAPI/bot process with real env.
+
+### 2026-05-29, Codex/GPT-5, bugfix pass
+- Исправлен расчет `/api/status/overview`: SSH denominator теперь отражает все
+  активные ноды, включая ноды без credentials, а не только реально проверенные
+  SSH-подключения.
+- Верхняя панель Mini App теперь показывает количество серверов из локального
+  инвентаря как fallback, чтобы при сбое overview не было `Серверы 0`.
+- Добавлена вкладка `Мониторинг` с карточками состояния и таблицей нод.
+- Инвентарь на desktop/mobile раскрывает все inbound host bindings с SNI/port.
+- `services/security.py:ssh_audit` фильтрует рутинные successful logins с
+  текущего Control Tower source IP, master-нод и IP из
+  `SSH_AUDIT_TRUSTED_IPS`, а также дедуплицирует события.
+- `services/monitor.py:external_port_knocker` больше не выполняет `sed` по
+  `haproxy.cfg` и `systemctl reload haproxy`; автоматическая реакция ограничена
+  статусом панели и alert после 3 подряд неуспешных проверок.
+- Добавлена настройка `SSH_AUDIT_TRUSTED_IPS` в `config.py` и `.env.example`.
+- Проверки: `py_compile`, `compileall`, `npm run lint`, `npm run build`,
+  `git diff --check`; свежий build синхронизирован в `static/`.

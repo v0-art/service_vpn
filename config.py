@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     SSH_KEY_PATH: str = os.path.expanduser("~/.ssh/id_rsa")
     SSH_PORT: int = 2222
     MASTER_SECRET_KEY: str = ""
+    SSH_AUDIT_TRUSTED_IPS: str = ""
 
     # Web
     WEB_HOST: str = "127.0.0.1"

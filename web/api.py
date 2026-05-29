@@ -800,9 +800,9 @@ async def get_status_overview() -> Dict[str, Any]:
         }
 
     checked_nodes = await asyncio.gather(*(check_node_connection(node) for node in nodes))
-    checked_active_nodes = [node for node in checked_nodes if node["checked"]]
-    ssh_reachable = len([node for node in checked_active_nodes if node["connected"]])
-    ssh_unreachable = len(checked_active_nodes) - ssh_reachable
+    active_connection_rows = [node for node in checked_nodes if node.get("status") == "active"]
+    ssh_reachable = len([node for node in active_connection_rows if node["connected"]])
+    ssh_unreachable = max(0, nodes_active - ssh_reachable)
 
     return {
         "timestamp": int(time.time()),

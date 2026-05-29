@@ -11,6 +11,8 @@ from services.backup import backup_database
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
+PORT_KNOCKER_FAILURE_THRESHOLD = 3
+port_knocker_failures: dict[str, int] = {}
 
 async def check_disk_space(bot: Bot) -> None:
     """
@@ -65,7 +67,8 @@ async def check_billing(bot: Bot) -> None:
 async def external_port_knocker(bot: Bot) -> None:
     """
     Master-нода проверяет доступность портов 443 и 2096 на Ingress-нодах.
-    Это гарантирует, что трафик реально доходит до Ingress.
+    HAProxy автоматически не меняется: ручные изменения HAProxy проходят только
+    через UI с валидацией/rollback.
     """
     logger.info("Запуск External Port Knocker...")
     
@@ -94,27 +97,49 @@ async def external_port_knocker(bot: Bot) -> None:
         
         is_alive = success and "FAIL" not in result
         
-        if is_alive and ingress_status == 'offline':
-            # Нода ожила, возвращаем в балансировщик
-            recover_cmd = f"sed -i '/{ingress_ip}/s/^#*//' /etc/haproxy/haproxy.cfg && systemctl reload haproxy"
-            await ssh_manager.execute_command(master_ip, recover_cmd, timeout=10)
-            
-            async with get_db_connection() as db:
-                await db.execute("UPDATE nodes SET status = 'active' WHERE ip = ?", (ingress_ip,))
-                await db.commit()
-                
-            await send_alert(bot, f"🟢 <b>Auto-Recover!</b>\nIngress-нода <code>{ingress_ip}</code> снова доступна.\nАвтоматически возвращена в HAProxy.")
-            
-        elif not is_alive and ingress_status == 'active':
-            # Нода упала, убираем из балансировщика
-            failover_cmd = f"sed -i '/{ingress_ip}/s/^/#/' /etc/haproxy/haproxy.cfg && systemctl reload haproxy"
-            await ssh_manager.execute_command(master_ip, failover_cmd, timeout=10)
+        if is_alive:
+            port_knocker_failures[ingress_ip] = 0
+
+            if ingress_status == 'offline':
+                async with get_db_connection() as db:
+                    await db.execute("UPDATE nodes SET status = 'active' WHERE ip = ?", (ingress_ip,))
+                    await db.commit()
+
+                await send_alert(
+                    bot,
+                    f"🟢 <b>Ingress снова доступен!</b>\n"
+                    f"Master снова видит порты 443/2096 на <code>{ingress_ip}</code>.\n"
+                    "Статус в панели возвращен в <b>active</b>. HAProxy автоматически не изменялся.",
+                )
+            continue
+
+        current_failures = port_knocker_failures.get(ingress_ip, 0) + 1
+        port_knocker_failures[ingress_ip] = current_failures
+        logger.warning(
+            "Port Knocker: %s недоступен (%s/%s), result=%s",
+            ingress_ip,
+            current_failures,
+            PORT_KNOCKER_FAILURE_THRESHOLD,
+            result,
+        )
+
+        if current_failures < PORT_KNOCKER_FAILURE_THRESHOLD:
+            continue
+
+        if ingress_status == 'active':
+            port_knocker_failures[ingress_ip] = 0
             
             async with get_db_connection() as db:
                 await db.execute("UPDATE nodes SET status = 'offline' WHERE ip = ?", (ingress_ip,))
                 await db.commit()
-                
-            await send_alert(bot, f"🔴 <b>Auto-Failover! / Узел недоступен!</b>\nMaster не может достучаться до Ingress (<code>{ingress_ip}</code>).\nНода временно <b>отключена</b> из конфига HAProxy для защиты трафика.")
+
+            await send_alert(
+                bot,
+                f"🔴 <b>Ingress недоступен!</b>\n"
+                f"Master не может достучаться до портов 443/2096 на <code>{ingress_ip}</code> "
+                f"{PORT_KNOCKER_FAILURE_THRESHOLD} проверки подряд.\n"
+                "Статус в панели выставлен в <b>offline</b>. HAProxy автоматически не изменялся.",
+            )
 
 async def check_decoy_watchdog(bot: Bot) -> None:
     """Проверяет, отдает ли Nginx Decoy HTTP 200."""

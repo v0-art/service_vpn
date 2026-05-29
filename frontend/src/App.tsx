@@ -4,6 +4,7 @@ import {
   Activity,
   AlertCircle,
   CheckCircle2,
+  Gauge,
   Lock,
   Menu,
   Network,
@@ -49,7 +50,7 @@ import {
   SystemOverview,
 } from './types';
 
-type Tab = 'inventory' | 'deploy' | 'haproxy' | 'marzban' | 'security' | 'logs';
+type Tab = 'inventory' | 'monitoring' | 'deploy' | 'haproxy' | 'marzban' | 'security' | 'logs';
 
 type Banner = {
   type: 'success' | 'error' | 'info';
@@ -81,6 +82,7 @@ const inboundOptions: Array<{ value: InboundTag; label: string }> = [
 
 const navItems: Array<{ tab: Tab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
   { tab: 'inventory', label: 'Инвентарь', icon: Server },
+  { tab: 'monitoring', label: 'Мониторинг', icon: Gauge },
   { tab: 'deploy', label: 'Добавить сервер', icon: Plus },
   { tab: 'haproxy', label: 'HAProxy', icon: Settings2 },
   { tab: 'marzban', label: 'Marzban', icon: Activity },
@@ -110,6 +112,53 @@ function roleListLabel(node: AppNode): string {
     return node.roles.join(', ');
   }
   return roleLabels[node.role];
+}
+
+type InboundDisplayItem = {
+  id?: number | string;
+  inbound_tag: string;
+  remark?: string | null;
+  address?: string | null;
+  port?: number | null;
+  sni?: string | null;
+  host?: string | null;
+  fingerprint?: string | null;
+  is_disabled?: boolean;
+};
+
+function inboundDisplayItems(node: AppNode): InboundDisplayItem[] {
+  const stored = (node.inbounds || []).filter((inbound) => inbound && inbound.inbound_tag);
+  if (stored.length > 0) {
+    return stored;
+  }
+
+  return [
+    {
+      id: 'legacy',
+      inbound_tag: node.inbound_tag,
+      remark: node.name,
+      address: node.ip,
+      port: node.inbound_port,
+      sni: node.group_sni,
+      host: node.group_sni,
+      fingerprint: node.fingerprint,
+      is_disabled: false,
+    },
+  ];
+}
+
+function inboundName(item: InboundDisplayItem): string {
+  const remark = String(item.remark || '').trim();
+  if (remark && remark !== item.inbound_tag) {
+    return `${item.inbound_tag} / ${remark}`;
+  }
+  return item.inbound_tag;
+}
+
+function inboundEndpoint(node: AppNode, item: InboundDisplayItem): string {
+  const sni = String(item.sni || item.host || node.group_sni || item.address || node.ip).trim();
+  const port = item.port || node.inbound_port || 443;
+  return `${sni}:${port}`;
 }
 
 function marzbanNodeId(node: MarzbanNode): number | undefined {
@@ -288,7 +337,7 @@ export default function App() {
     };
   }, []);
 
-  const connectionByIp = useMemo(() => {
+  const connectionByIp = useMemo<Map<string, NodeConnectionStatus>>(() => {
     const map = new Map<string, NodeConnectionStatus>();
     for (const node of overview?.nodes || []) {
       map.set(node.ip, node);
@@ -297,6 +346,13 @@ export default function App() {
   }, [overview]);
 
   const marzbanConnected = Boolean(marzbanConn?.connected ?? overview?.marzban_connected);
+  const nodesTotalCount = Math.max(overview?.nodes_total ?? 0, nodes.length);
+  const activeNodesCount = Math.max(overview?.nodes_active ?? 0, nodes.filter((node) => node.status === 'active').length);
+  const sshReachableCount = Math.max(
+    overview?.ssh_reachable ?? 0,
+    nodes.filter((node) => connectionByIp.get(node.ip)?.connected).length
+  );
+  const sshStatusText = `${sshReachableCount}/${activeNodesCount}`;
 
   const reconnectMarzbanNow = async () => {
     setReconnectBusy(true);
@@ -440,16 +496,16 @@ export default function App() {
               <StatusBadge
                 label="SSH"
                 loading={overviewLoading}
-                ok={(overview?.ssh_reachable || 0) > 0 || (overview?.nodes_active || 0) === 0}
-                okText={`${overview?.ssh_reachable ?? 0}/${overview?.nodes_active ?? 0}`}
-                badText="недоступно"
+                ok={activeNodesCount === 0 || sshReachableCount === activeNodesCount}
+                okText={sshStatusText}
+                badText={sshStatusText}
               />
               <StatusBadge
                 label="Серверы"
                 loading={overviewLoading}
-                ok={(overview?.nodes_total ?? 0) > 0}
-                okText={`${overview?.nodes_total ?? 0}`}
-                badText="пусто"
+                ok={nodesTotalCount > 0}
+                okText={`${nodesTotalCount}`}
+                badText="0"
               />
             </div>
 
@@ -518,6 +574,19 @@ export default function App() {
                   connectionByIp={connectionByIp}
                   onEdit={(node) => setEditingNode(node)}
                   onDelete={handleDeleteNode}
+                />
+              </motion.div>
+            )}
+
+            {activeTab === 'monitoring' && (
+              <motion.div key="monitoring" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }} className="flex flex-col h-full w-full">
+                <MonitoringView
+                  nodes={nodes}
+                  overview={overview}
+                  marzbanConn={marzbanConn}
+                  loading={overviewLoading}
+                  connectionByIp={connectionByIp}
+                  onRefresh={refreshAll}
                 />
               </motion.div>
             )}
@@ -667,6 +736,144 @@ function ConfirmDialog({ action, onClose }: { action: ConfirmAction; onClose: ()
   );
 }
 
+function MonitoringView({
+  nodes,
+  overview,
+  marzbanConn,
+  loading,
+  connectionByIp,
+  onRefresh,
+}: {
+  nodes: AppNode[];
+  overview: SystemOverview | null;
+  marzbanConn: MarzbanConnection | null;
+  loading: boolean;
+  connectionByIp: Map<string, NodeConnectionStatus>;
+  onRefresh: () => Promise<void>;
+}) {
+  const activeNodes = nodes.filter((node) => node.status === 'active').length;
+  const nodesTotal = Math.max(overview?.nodes_total ?? 0, nodes.length);
+  const nodesActive = Math.max(overview?.nodes_active ?? 0, activeNodes);
+  const sshReachable = Math.max(
+    overview?.ssh_reachable ?? 0,
+    nodes.filter((node) => connectionByIp.get(node.ip)?.connected).length
+  );
+  const sshUnreachable = Math.max(overview?.ssh_unreachable ?? 0, nodesActive - sshReachable);
+  const usersCount = marzbanConn?.users_count ?? overview?.marzban_users_count ?? 0;
+  const marzbanOk = Boolean(marzbanConn?.connected ?? overview?.marzban_connected);
+
+  return (
+    <div className="flex flex-col gap-4 max-w-6xl mx-auto w-full">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold uppercase tracking-[0.05em] text-app-muted">Мониторинг кластера</div>
+          <div className="text-xs text-app-muted mt-1 font-mono">Обновлено: {overview?.timestamp ? new Date(overview.timestamp * 1000).toLocaleString('ru-RU') : 'нет данных'}</div>
+        </div>
+        <button onClick={onRefresh} className="px-3 py-2 border border-app-border rounded-md text-xs font-semibold cursor-pointer transition-opacity hover:opacity-80 flex items-center gap-2">
+          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+          Обновить
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+        <MetricTile label="Серверы" value={`${nodesTotal}`} detail={`активно ${nodesActive}`} tone={nodesTotal > 0 ? 'success' : 'danger'} />
+        <MetricTile label="SSH" value={`${sshReachable}/${nodesActive}`} detail={`недоступно ${sshUnreachable}`} tone={sshUnreachable === 0 ? 'success' : 'danger'} />
+        <MetricTile label="Marzban" value={marzbanOk ? 'connected' : 'error'} detail={marzbanConn?.error_code || overview?.marzban_error_code || 'статус'} tone={marzbanOk ? 'success' : 'danger'} />
+        <MetricTile label="Пользователи" value={`${usersCount}`} detail="данные Marzban" tone="neutral" />
+      </div>
+
+      <div className="bg-app-card border border-app-border rounded-lg overflow-hidden">
+        <div className="p-4 border-b border-app-border flex items-center gap-2">
+          <Gauge className="w-4 h-4 text-app-accent" />
+          <span className="text-sm font-semibold uppercase tracking-[0.05em] text-app-muted">Состояние нод</span>
+        </div>
+        <div className="overflow-auto">
+          <table className="w-full text-left border-collapse min-w-[900px]">
+            <thead>
+              <tr>
+                <th className="p-4 text-[11px] text-app-muted uppercase font-semibold border-b border-app-border">Нода</th>
+                <th className="p-4 text-[11px] text-app-muted uppercase font-semibold border-b border-app-border">SSH</th>
+                <th className="p-4 text-[11px] text-app-muted uppercase font-semibold border-b border-app-border">Доступ</th>
+                <th className="p-4 text-[11px] text-app-muted uppercase font-semibold border-b border-app-border">Marzban</th>
+                <th className="p-4 text-[11px] text-app-muted uppercase font-semibold border-b border-app-border">Inbound</th>
+              </tr>
+            </thead>
+            <tbody>
+              {nodes.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="p-8 text-center text-app-muted text-xs font-mono uppercase tracking-widest">
+                    Серверы еще не добавлены
+                  </td>
+                </tr>
+              ) : (
+                nodes.map((node) => {
+                  const connection = connectionByIp.get(node.ip);
+                  return (
+                    <tr key={node.id} className="hover:bg-app-text/5 transition-colors">
+                      <td className="p-4 border-b border-app-border">
+                        <div className="font-semibold text-[13px]">{node.name}</div>
+                        <div className="font-mono text-xs text-app-accent mt-1">{node.ip}:{node.ssh_port}</div>
+                      </td>
+                      <td className="p-4 border-b border-app-border">
+                        <NodeStatusBadge node={node} connection={connection} />
+                        {connection?.error && <div className="mt-1 text-[11px] text-app-danger max-w-[260px] truncate">{connection.error}</div>}
+                      </td>
+                      <td className="p-4 border-b border-app-border text-[12px] font-mono">
+                        {credentialLabel(node)}
+                      </td>
+                      <td className="p-4 border-b border-app-border text-[12px] font-mono">
+                        <div>{node.marzban_node_status || 'unknown'}</div>
+                        {node.marzban_last_error && <div className="text-app-danger mt-1 max-w-[240px] truncate">{node.marzban_last_error}</div>}
+                      </td>
+                      <td className="p-4 border-b border-app-border text-[12px] font-mono">
+                        <div className="space-y-1">
+                          {inboundDisplayItems(node).map((item, index) => (
+                            <div key={`${item.inbound_tag}-${item.id || index}`} className="text-app-muted leading-snug">
+                              <div className="text-app-text break-words">{inboundName(item)}</div>
+                              <div className="text-[11px] break-words">{inboundEndpoint(node, item)}{item.is_disabled ? ' · disabled' : ''}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {[
+          ['Порты ingress', '15 минут'],
+          ['Decoy watchdog', '5 минут'],
+          ['Latency links', '30 минут'],
+          ['SSH audit', '15 минут'],
+          ['UFW scanners', '15 минут'],
+          ['Billing', '10:00 ежедневно'],
+        ].map(([name, interval]) => (
+          <div key={name} className="border border-app-border rounded-lg bg-app-card p-3">
+            <div className="text-[11px] uppercase tracking-wide text-app-muted font-semibold">{name}</div>
+            <div className="text-xs font-mono text-app-text mt-1">{interval}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MetricTile({ label, value, detail, tone }: { label: string; value: string; detail: string; tone: 'success' | 'danger' | 'neutral' }) {
+  const toneClass = tone === 'success' ? 'text-app-success' : tone === 'danger' ? 'text-app-danger' : 'text-app-accent';
+  return (
+    <div className="bg-app-card border border-app-border rounded-lg p-4">
+      <div className="text-[11px] uppercase tracking-wide text-app-muted font-semibold">{label}</div>
+      <div className={`mt-2 text-xl font-mono font-semibold ${toneClass}`}>{value}</div>
+      <div className="mt-1 text-xs text-app-muted font-mono">{detail}</div>
+    </div>
+  );
+}
+
 function InventoryView({
   nodes,
   loading,
@@ -739,8 +946,14 @@ function InventoryView({
                 <NodeStatusBadge node={node} connection={connectionByIp.get(node.ip)} />
               </div>
               <div className="mt-2 text-xs text-app-muted">Роли: {roleListLabel(node)}</div>
-              <div className="mt-1 text-xs text-app-muted">Inbound: {node.inbounds?.length ? `${node.inbounds.length} привязок` : node.inbound_tag}</div>
-              <div className="mt-1 text-xs text-app-muted">SNI/порт: {node.group_sni}:{node.inbound_port}</div>
+              <div className="mt-2 space-y-1">
+                {inboundDisplayItems(node).map((item, index) => (
+                  <div key={`${item.inbound_tag}-${item.id || index}`} className="text-xs text-app-muted font-mono">
+                    <span className="text-app-text">{inboundName(item)}</span>
+                    <span className="block text-[11px]">{inboundEndpoint(node, item)}{item.is_disabled ? ' · disabled' : ''}</span>
+                  </div>
+                ))}
+              </div>
               <div className="mt-1 text-xs text-app-muted">SSH: {node.ssh_username || 'root'}@{node.ssh_port}, {credentialLabel(node)}</div>
 
               <div className="mt-3 grid grid-cols-2 gap-2">
@@ -771,6 +984,8 @@ const NodeRow: React.FC<{
   onEdit: () => void;
   onDelete: () => void;
 }> = ({ node, connection, onEdit, onDelete }) => {
+  const inboundItems = inboundDisplayItems(node);
+
   return (
     <tr className="hover:bg-app-text/5 transition-colors group relative">
       <td className="p-4 border-b border-app-border text-[13px] font-semibold">{node.name}</td>
@@ -790,8 +1005,25 @@ const NodeRow: React.FC<{
           )}
         </div>
       </td>
-      <td className="p-4 border-b border-app-border text-[12px] font-mono">{node.inbounds?.length ? `${node.inbounds.length} inbound` : node.inbound_tag}</td>
-      <td className="p-4 border-b border-app-border text-[12px] font-mono">{node.group_sni}:{node.inbound_port}</td>
+      <td className="p-4 border-b border-app-border text-[12px] font-mono">
+        <div className="space-y-1.5 max-w-[280px]">
+          {inboundItems.map((item, index) => (
+            <div key={`${item.inbound_tag}-${item.id || index}`} className="leading-snug">
+              <div className="text-app-text break-words">{inboundName(item)}</div>
+              {item.is_disabled && <div className="text-app-warning text-[10px] uppercase tracking-wide">disabled</div>}
+            </div>
+          ))}
+        </div>
+      </td>
+      <td className="p-4 border-b border-app-border text-[12px] font-mono">
+        <div className="space-y-1.5 max-w-[240px]">
+          {inboundItems.map((item, index) => (
+            <div key={`${item.inbound_tag}-${item.id || index}`} className="text-app-muted break-words">
+              {inboundEndpoint(node, item)}
+            </div>
+          ))}
+        </div>
+      </td>
       <td className="p-4 border-b border-app-border text-[13px]">
         <NodeStatusBadge node={node} connection={connection} />
       </td>
@@ -1036,16 +1268,13 @@ function DeployForm({
                   {selectedMarzbanHosts.length === 0 ? (
                     <div className="text-xs text-app-warning font-mono">hosts по IP этой Node не найдены</div>
                   ) : (
-                    selectedMarzbanHosts.slice(0, 5).map((item, index) => (
+                    selectedMarzbanHosts.map((item, index) => (
                       <div key={`${item.inboundTag}-${index}-${String(item.host.remark || item.host.address || item.host.sni)}`} className="text-[11px] font-mono text-app-muted flex flex-wrap gap-x-2">
                         <span className="text-app-text">{item.inboundTag}</span>
                         <span>{String(item.host.remark || 'без имени')}</span>
                         <span>{String(item.host.sni || item.host.host || 'без SNI')}:{String(item.host.port || '443')}</span>
                       </div>
                     ))
-                  )}
-                  {selectedMarzbanHosts.length > 5 && (
-                    <div className="text-[11px] text-app-muted font-mono">+{selectedMarzbanHosts.length - 5} inbound</div>
                   )}
                 </div>
               </div>
